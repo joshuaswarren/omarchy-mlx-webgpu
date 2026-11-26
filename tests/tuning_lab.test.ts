@@ -103,7 +103,7 @@ describe("Tuning Lab config, URL share links, and parity-gated scoring", () => {
     expect(basicLevers.find((l) => l.key === "useSubgroups")?.supportedValues).toEqual([false]);
   });
 
-  it("round-trips share URL encoding and parsing", () => {
+  it("round-trips share URL encoding and parsing (including optional custom prompt)", () => {
     const cfg: TuningConfig = {
       ...DEFAULT_TUNING_CONFIG,
       oneDispatchAttention: true,
@@ -119,8 +119,20 @@ describe("Tuning Lab config, URL share links, and parity-gated scoring", () => {
     const parsed = parseTuningUrl(new URL(url).search);
     expect(parsed.openTuningTab).toBe(true);
     expect(parsed.hasTuningParams).toBe(true);
+    expect(parsed.prompt).toBeUndefined();
     const roundTripped = normalizeTuningConfig(parsed.patch, METAL_ADAPTER);
     expect(configKey(roundTripped)).toBe(configKey(cfg));
+
+    const customPrompt = "Explain RMSNorm in one sentence.";
+    const urlWithPrompt = encodeConfigToUrl(
+      cfg,
+      "https://joshuaswarren.github.io/omarchy-mlx-webgpu/",
+      true,
+      customPrompt,
+    );
+    const parsedWithPrompt = parseTuningUrl(new URL(urlWithPrompt).search);
+    expect(parsedWithPrompt.prompt).toBe(customPrompt);
+    expect(configKey(normalizeTuningConfig(parsedWithPrompt.patch, METAL_ADAPTER))).toBe(configKey(cfg));
   });
 
   it("scores exact reference match as tok/s and scores ANY output divergence as 0", () => {
@@ -201,6 +213,51 @@ describe("Coordinate-ascent hill climber", () => {
     expect(failStep!.parityPass).toBe(false);
     expect(failStep!.score).toBe(0);
     expect(failStep!.status).toBe("parity_fail");
+    expect(report.passesCompleted).toBeGreaterThanOrEqual(1);
+  });
+
+  it("uses multi-pass coordinate ascent to unlock non-separable lever synergies", async () => {
+    const refTokens = [7, 8, 9];
+    const report = await runCoordinateHillClimb({
+      prompt: "synergy",
+      tokenBudget: 3,
+      startConfig: BASELINE_TUNING_CONFIG,
+      adapter: BASIC_ADAPTER,
+      referenceTokens: refTokens,
+      maxPasses: 2,
+      evaluate: async (cfg, label, step) => {
+        // Synthetic interaction: fusedRopeNorm is slightly slower at wg=64 (-2),
+        // but once wg=256 wins later in pass 1, wg=256 + fusedRopeNorm unlocks +30!
+        let tps = 40;
+        if (cfg.qmmWorkgroupSize === 256) tps += 10;
+        if (cfg.fusedRopeNorm) {
+          tps += cfg.qmmWorkgroupSize === 256 ? 30 : -2;
+        }
+        const scored = scoreTuningRun({ tokens: refTokens, refTokens, avgTokPerSec: tps });
+        return {
+          step,
+          label,
+          config: cfg,
+          configKey: configKey(cfg),
+          tokPerSec: tps,
+          msPerTok: 1000 / tps,
+          dispatchesPerTok: 481,
+          tokens: [...refTokens],
+          text: "ok",
+          ...scored,
+          status: "manual",
+          shareUrl: encodeConfigToUrl(cfg, "https://example.test/", true, "synergy"),
+          timestampMs: Date.now(),
+        };
+      },
+    });
+
+    // Pass 1 takes wg=256 (50), Pass 2 revisits rope=true on top of wg=256 -> 80!
+    expect(report.passesCompleted).toBe(2);
+    expect(report.best.config.qmmWorkgroupSize).toBe(256);
+    expect(report.best.config.fusedRopeNorm).toBe(true);
+    expect(report.best.score).toBe(80);
+    expect(report.steps.some((s) => s.label === "p2: rope=true" && s.status === "accepted")).toBe(true);
   });
 
   it("throws WebGpuUnavailableError when navigator.gpu is missing", async () => {

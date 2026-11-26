@@ -41,11 +41,20 @@ Example share URL:
 https://joshuaswarren.github.io/omarchy-mlx-webgpu/?tab=tuning&attn=1&rope=1&swiglu=1&wg=256&prec=f16&sg=1&batch=single_pass&pace=unthrottled
 ```
 
+When a non-default benchmark prompt is active, generated share URLs automatically preserve `&prompt=<encoded>` alongside the lever parameters.
+
 Unsupported adapter capabilities (for example `prec=f16` on an adapter without `shader-f16`, or `sg=1` without `subgroups`) are clamped safely to supported values during normalization.
 
 ## Page JSON API (`window.omarchyLab`)
 
-Once the page boots (`document.title` starts with `PARITY_PASS`), `window.omarchyLab` is available:
+During boot, `document.title` resolves to one of four terminal prefixes:
+
+- `PARITY_PASS` — WebGPU initialized and all 10 boot kernels passed CPU parity (ready to run `window.omarchyLab`)
+- `PARITY_FAIL` — WebGPU initialized, but a boot parity check failed
+- `PARITY_ERROR` — WebGPU initialized, but device setup or shader compilation threw an error
+- `WebGPU unavailable` — browser lacks WebGPU (`navigator.gpu` missing or no adapter); stop immediately instead of waiting for `PARITY_PASS`
+
+Once `document.title` starts with `PARITY_PASS`, `window.omarchyLab` is ready:
 
 | Method | Signature | Returns |
 |---|---|---|
@@ -53,9 +62,9 @@ Once the page boots (`document.title` starts with `PARITY_PASS`), `window.omarch
 | `getLevers()` | `() => LeverSpec[]` | Every lever, all values, `supportedValues` on this GPU, and its `urlParam` |
 | `set(patch)` | `(patch: Partial<TuningConfig>) => TuningConfig` | Validates, normalizes, syncs UI & URL, returns active `TuningConfig` |
 | `run(opts?)` | `(opts?: { config?, prompt?, tokens?, label? }) => Promise<TuningEvalResult>` | Evaluates one config against reference tokens and returns scored JSON |
-| `hillClimb(opts?)` | `(opts?: { start?: "baseline" \| "current", prompt?, tokens? }) => Promise<HillClimbReport>` | Runs built-in coordinate ascent over all supported levers and returns full path JSON |
+| `hillClimb(opts?)` | `(opts?: { start?: "baseline" \| "current", prompt?, tokens?, maxPasses?: number }) => Promise<HillClimbReport>` | Runs multi-pass coordinate ascent (default `maxPasses: 2`, stops early on convergence) over all supported levers and returns full path JSON |
 | `read()` | `() => { adapter, config, last, best, history, shareUrl }` | Latest evaluation, best winning config, full history, and share link as plain JSON |
-| `shareUrl(cfg?)` | `(cfg?: Partial<TuningConfig>) => string` | Shareable URL for the best (or specified) config |
+| `shareUrl(cfg?, prompt?)` | `(cfg?: Partial<TuningConfig>, prompt?: string) => string` | Shareable URL for the best (or specified) config, preserving custom `prompt=` when set |
 | `stop()` | `() => void` | Cancels an in-flight benchmark or hill climb |
 
 After every state update, the page also writes the latest JSON snapshot into `<script type="application/json" id="omarchy-lab-state">` in `<head>`, so DOM-only tools can read it without evaluating custom scripts.
@@ -100,7 +109,15 @@ const browser = await chromium.launch({
 });
 const page = await browser.newPage();
 await page.goto("https://joshuaswarren.github.io/omarchy-mlx-webgpu/?tab=tuning");
-await page.waitForFunction(() => /PARITY_PASS/.test(document.title), null, { timeout: 120_000 });
+await page.waitForFunction(
+  () => /^(PARITY_|WebGPU unavailable)/.test(document.title),
+  null,
+  { timeout: 120_000 },
+);
+const title = await page.title();
+if (!title.startsWith("PARITY_PASS")) {
+  throw new Error(`Tuning Lab cannot run on this browser: ${title}`);
+}
 
 // Option A: run the built-in coordinate-ascent hill climber
 const report = await page.evaluate(() =>

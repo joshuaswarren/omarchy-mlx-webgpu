@@ -190,6 +190,7 @@ export interface HillClimbReport {
   baseline: TuningEvalResult;
   best: TuningEvalResult;
   steps: TuningEvalResult[];
+  passesCompleted: number;
   gainPct: number;
   shareUrl: string;
   stoppedEarly: boolean;

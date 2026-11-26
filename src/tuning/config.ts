@@ -254,6 +254,7 @@ export function encodeConfigToUrl(
   config: TuningConfig,
   originAndPath: string,
   includeTab = true,
+  prompt?: string,
 ): string {
   const url = new URL(originAndPath);
   url.search = "";
@@ -269,6 +270,10 @@ export function encodeConfigToUrl(
   if (config.faultEnabled) {
     url.searchParams.set("fault", "1");
     url.searchParams.set("faultTarget", config.faultTarget);
+  }
+  const trimmedPrompt = prompt?.trim();
+  if (trimmedPrompt) {
+    url.searchParams.set("prompt", trimmedPrompt);
   }
   return url.toString();
 }
