@@ -1,0 +1,18 @@
+{
+  "name": "omarchy-mlx-webgpu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test:cpu": "bun test tests/cpu_reference.test.ts",
+    "test:webgpu": "node tests/run_webgpu_parity.mjs"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.60",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.0"
+  }
+}
