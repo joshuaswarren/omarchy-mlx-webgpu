@@ -38,8 +38,11 @@ import {
   verifyEmbedQ4Parity,
   verifyFastRopeNormParity,
   verifyFastRopeParity,
+  verifyKvCacheWriteParity,
+  verifyQmmVecLmHeadParity,
   verifyQmmVecParity,
   verifyQmmVecSwigluParity,
+  verifyResidualAddParity,
   verifySwigluParity,
 } from "./webgpu/parity_kernels";
 
@@ -110,23 +113,28 @@ declare global {
       attentionDispatches: number;
     }>;
     __RUN_AB_RACE__?: (prompt?: string, tokenBudget?: number) => Promise<AbRaceResult | null>;
+    __VERIFY_LM_HEAD_PARITY__?: (faultMode?: boolean) => Promise<ParityResult | null>;
     omarchyLab?: OmarchyLabApi;
   }
 }
 
 async function runFullParitySuite(
   device: GPUDevice,
-  fault: FaultConfig | boolean,
+  fault: FaultConfig | boolean | "all",
 ): Promise<ParityResult[]> {
+  const allF = fault === "all";
   const fc: FaultConfig =
-    typeof fault === "boolean"
-      ? { enabled: fault, target: "attention" }
-      : { enabled: fault.enabled, target: fault.target ?? "attention" };
+    fault === "all"
+      ? { enabled: true, target: "attention" }
+      : typeof fault === "boolean"
+        ? { enabled: fault, target: "attention" }
+        : { enabled: fault.enabled, target: fault.target ?? "attention" };
   const target = fc.target ?? "attention";
-  const attnF = fc.enabled && target === "attention";
-  const qmmF = fc.enabled && target === "qmm";
-  const ropeF = fc.enabled && target === "rope";
-  const normF = fc.enabled && target === "norm";
+  const attnF = allF || (fc.enabled && target === "attention");
+  const qmmF = allF || (fc.enabled && target === "qmm");
+  const ropeF = allF || (fc.enabled && target === "rope");
+  const normF = allF || (fc.enabled && target === "norm");
+  const elemF = allF;
   return [
     await verifySdpaOnlineParity(device, 16, 8, 192, attnF),
     await verifySdpaSplitParity(device, 16, 8, 192, attnF),
@@ -135,9 +143,11 @@ async function runFullParitySuite(
     await verifyFastRopeNormParity(device, 16, 128, 42, 1e-6, 1_000_000, ropeF || normF),
     await verifyQmmVecSwigluParity(device, 512, 1024, 64, qmmF),
     await verifyFastRopeParity(device, 16, 128, 42, 1_000_000, ropeF),
-    await verifySwigluParity(device, 3072, false),
-    await verifyEmbedQ4Parity(device, 4096, 1024, 1337, 64),
-    await verifyArgmaxParity(device, 151936),
+    await verifySwigluParity(device, 3072, elemF),
+    await verifyEmbedQ4Parity(device, 4096, 1024, 1337, 64, elemF),
+    await verifyResidualAddParity(device, 1024, elemF),
+    await verifyKvCacheWriteParity(device, 8, 128, 64, 17, elemF),
+    await verifyArgmaxParity(device, 151936, elemF),
   ];
 }
 
@@ -686,7 +696,7 @@ async function boot() {
         typeof faultOrEnabled === "boolean"
           ? { enabled: faultOrEnabled, target: tuningConfig.faultTarget }
           : faultOrEnabled;
-      ui.setStatus("Running 10-kernel WebGPU vs CPU parity…", "busy");
+      ui.setStatus("Running 12-kernel WebGPU vs CPU parity…", "busy");
       const results = await runFullParitySuite(gpu.device, fc);
       ui.setParityResults(results);
       const allPass = results.every((r) => r.passed);
@@ -741,6 +751,9 @@ async function boot() {
 
   window.__RUN_AB_RACE__ = (prompt, tokenBudget = 24) =>
     runAbRace(prompt ?? DEFAULT_PROMPT, tokenBudget);
+
+  window.__VERIFY_LM_HEAD_PARITY__ = async (faultMode = false) =>
+    gpu ? verifyQmmVecLmHeadParity(gpu.device, 151936, 1024, 64, faultMode) : null;
 
   window.__SMOKE_GENERATE__ = async (prompt, maxTokens = 24, optsOverride, faultOn = false) => {
     const faultPatch: Partial<TuningConfig> =
@@ -820,15 +833,16 @@ async function boot() {
     publishLabState(false);
 
     const cleanResults = await runFullParitySuite(gpu.device, false);
-    const faultResults = [await verifySdpaOnlineParity(gpu.device, 16, 8, 192, true)];
+    const faultResults = await runFullParitySuite(gpu.device, "all");
     ui.setParityResults(
       tuningConfig.faultEnabled
         ? await runFullParitySuite(gpu.device, toFaultConfig(tuningConfig))
         : cleanResults,
     );
 
-    const allCleanPassed = cleanResults.every((r) => r.passed);
-    const allFaultsDetected = faultResults.every((r) => !r.passed);
+    const allCleanPassed = cleanResults.length > 0 && cleanResults.every((r) => r.passed);
+    const allFaultsDetected =
+      faultResults.length === cleanResults.length && faultResults.every((r) => !r.passed);
     window.__PARITY_REPORT__ = {
       adapter: gpu.info,
       model: QWEN3_0_6B_4BIT.repoId,

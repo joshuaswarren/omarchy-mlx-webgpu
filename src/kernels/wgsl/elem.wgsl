@@ -15,7 +15,7 @@ struct EmbedParams {
   token_id: u32,
   hidden_size: u32,
   group_size: u32,
-  _pad0: u32,
+  fault_mode: u32,
 };
 
 @group(0) @binding(0) var<storage, read> emb_weights: array<u32>;
@@ -35,6 +35,7 @@ fn embed_q4(
   let groups_per_row = hidden_size / emb_params.group_size;
   let w_row = emb_params.token_id * words_per_row;
   let g_row = emb_params.token_id * groups_per_row;
+  let fault = emb_params.fault_mode != 0u;
   let stride = num_wg.x * 256u;
 
   for (var d = gid.x; d < hidden_size; d = d + stride) {
@@ -43,7 +44,7 @@ fn embed_q4(
     let q = (word >> shift) & 0xfu;
     let g_idx = d / emb_params.group_size;
     let scale = emb_scales[g_row + g_idx];
-    let bias = emb_biases[g_row + g_idx];
+    let bias = select(emb_biases[g_row + g_idx], 0.0, fault);
     emb_dst[d] = f32(q) * scale + bias;
   }
 }
@@ -61,6 +62,7 @@ fn embed_q4_indirect(
   let groups_per_row = hidden_size / emb_params.group_size;
   let w_row = token_id * words_per_row;
   let g_row = token_id * groups_per_row;
+  let fault = emb_params.fault_mode != 0u;
   let stride = num_wg.x * 256u;
 
   for (var d = gid.x; d < hidden_size; d = d + stride) {
@@ -69,7 +71,7 @@ fn embed_q4_indirect(
     let q = (word >> shift) & 0xfu;
     let g_idx = d / emb_params.group_size;
     let scale = emb_scales[g_row + g_idx];
-    let bias = emb_biases[g_row + g_idx];
+    let bias = select(emb_biases[g_row + g_idx], 0.0, fault);
     emb_dst[d] = f32(q) * scale + bias;
   }
 }
@@ -79,7 +81,7 @@ fn embed_q4_indirect(
 // -----------------------------------------------------------------------------
 struct AddParams {
   count: u32,
-  _pad0: u32,
+  fault_mode: u32,
   _pad1: u32,
   _pad2: u32,
 };
@@ -95,8 +97,10 @@ fn residual_add(
   @builtin(num_workgroups) num_wg: vec3<u32>,
 ) {
   let stride = num_wg.x * 256u;
+  let fault = add_params.fault_mode != 0u;
   for (var idx = gid.x; idx < add_params.count; idx = idx + stride) {
-    add_dst[idx] = add_a[idx] + add_b[idx];
+    let b = select(add_b[idx], -add_b[idx], fault);
+    add_dst[idx] = add_a[idx] + b;
   }
 }
 
@@ -108,6 +112,10 @@ struct KvWriteParams {
   head_dim: u32,
   max_seq: u32,
   pos: u32,
+  fault_mode: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
 };
 
 @group(0) @binding(9) var<storage, read> kv_k_in: array<f32>;
@@ -124,13 +132,14 @@ fn kv_cache_write(
   let head_dim = kv_params.head_dim;
   let total = kv_params.kv_heads * head_dim;
   let stride = num_wg.x * 256u;
+  let fault = kv_params.fault_mode != 0u;
 
   for (var idx = gid.x; idx < total; idx = idx + stride) {
     let h = idx / head_dim;
     let d = idx - h * head_dim;
     let dst_idx = (h * kv_params.max_seq + kv_params.pos) * head_dim + d;
     kv_k_cache[dst_idx] = kv_k_in[idx];
-    kv_v_cache[dst_idx] = kv_v_in[idx];
+    kv_v_cache[dst_idx] = select(kv_v_in[idx], -kv_v_in[idx], fault);
   }
 }
 
@@ -143,7 +152,7 @@ fn kv_cache_write(
 struct ArgmaxParams {
   count: u32,
   num_blocks: u32,
-  _pad0: u32,
+  fault_mode: u32,
   _pad1: u32,
 };
 
@@ -254,7 +263,12 @@ fn argmax_p2(
   }
 
   if (tid == 0u) {
-    amax_out_idx[0] = s_amax_idx[0];
+    let out_idx = select(
+      s_amax_idx[0],
+      (s_amax_idx[0] + 1u) % max(1u, amax_params.count),
+      amax_params.fault_mode != 0u,
+    );
+    amax_out_idx[0] = out_idx;
     amax_out_val[0] = s_amax_val[0];
   }
 }

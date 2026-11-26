@@ -324,7 +324,7 @@ export class Qwen3WebGpuEngine {
     this.uRopeK = mkRopeU(KV);
     this.uRopeNormQ = mkRopeNormU(Q);
     this.uRopeNormK = mkRopeNormU(KV);
-    this.uKvWrite = createUniformBuffer(device, new Uint32Array([KV, D, MAX_SEQ, 0]), "uKvWrite");
+    this.uKvWrite = createUniformBuffer(device, new Uint32Array([KV, D, MAX_SEQ, 0, 0, 0, 0, 0]), "uKvWrite");
     const sdpaAb = new ArrayBuffer(32);
     const su = new Uint32Array(sdpaAb); const sf = new Float32Array(sdpaAb);
     su[0] = Q; su[1] = KV; su[2] = 1; su[3] = MAX_SEQ; sf[4] = 1 / Math.sqrt(D); su[5] = 0; su[6] = 1;
@@ -758,15 +758,15 @@ export class Qwen3WebGpuEngine {
     writeRope(32, KV);
     writeRopeNorm(64, Q);
     writeRopeNorm(96, KV);
-    out.set(new Uint8Array(new Uint32Array([KV, D, MAX_SEQ, pos]).buffer), base + 128);
+    out.set(new Uint8Array(new Uint32Array([KV, D, MAX_SEQ, pos, 0, 0, 0, 0]).buffer), base + 128);
 
     const sdpaAb = new ArrayBuffer(32);
     const su = new Uint32Array(sdpaAb); const sf = new Float32Array(sdpaAb);
     su[0] = Q; su[1] = KV; su[2] = kLen; su[3] = MAX_SEQ;
     sf[4] = 1 / Math.sqrt(D); su[5] = attnFault; su[6] = nblocks;
     const sdpaBytes = new Uint8Array(sdpaAb);
-    out.set(sdpaBytes, base + 144);
-    out.set(sdpaBytes, base + 176);
+    out.set(sdpaBytes, base + 160);
+    out.set(sdpaBytes, base + 192);
 
     return nblocks;
   }
@@ -802,7 +802,7 @@ export class Qwen3WebGpuEngine {
     this.device.queue.writeBuffer(this.uRopeNormQ, 0, mkRopeNorm(Q));
     this.device.queue.writeBuffer(this.uRopeNormK, 0, mkRopeNorm(KV));
 
-    this.device.queue.writeBuffer(this.uKvWrite, 0, new Uint32Array([KV, D, MAX_SEQ, pos]));
+    this.device.queue.writeBuffer(this.uKvWrite, 0, new Uint32Array([KV, D, MAX_SEQ, pos, 0, 0, 0, 0]));
 
     const sdpaAb = new ArrayBuffer(32);
     const su = new Uint32Array(sdpaAb); const sf = new Float32Array(sdpaAb);
@@ -1072,9 +1072,9 @@ export class Qwen3WebGpuEngine {
       enc.copyBufferToBuffer(this.chainUniformStaging, base + 32, this.uRopeK, 0, 32);
       enc.copyBufferToBuffer(this.chainUniformStaging, base + 64, this.uRopeNormQ, 0, 32);
       enc.copyBufferToBuffer(this.chainUniformStaging, base + 96, this.uRopeNormK, 0, 32);
-      enc.copyBufferToBuffer(this.chainUniformStaging, base + 128, this.uKvWrite, 0, 16);
-      enc.copyBufferToBuffer(this.chainUniformStaging, base + 144, this.uSdpaOnline, 0, 32);
-      enc.copyBufferToBuffer(this.chainUniformStaging, base + 176, this.uSdpaSplit, 0, 32);
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 128, this.uKvWrite, 0, 32);
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 160, this.uSdpaOnline, 0, 32);
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 192, this.uSdpaSplit, 0, 32);
 
       const stepRes = this.encodeStepPass(
         enc,
