@@ -84,6 +84,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   let optFlags: OptFlags = { ...DEFAULT_OPT_FLAGS };
   let fault: FaultConfig = { enabled: false };
   let generating = false;
+  let adapterReady = false;
   let modelLoaded = false;
   let modelLoading = false;
   let selectedLayer = 14;
@@ -853,6 +854,8 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
 
   return {
     setAdapterInfo(info: GpuAdapterInfo) {
+      adapterReady = true;
+      adapterEl.classList.remove("is-error");
       const label = [info.vendor, info.architecture || info.device]
         .filter((s) => s && s !== "unknown")
         .join(" / ");
@@ -945,6 +948,13 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
         errorBannerEl.textContent = message;
         statusPillEl.textContent = "Error";
         statusPillEl.dataset.tone = "error";
+        if (!adapterReady) {
+          adapterEl.textContent = "No WebGPU";
+          adapterEl.classList.add("is-error");
+          if (parityResults.length === 0) {
+            parityListEl.innerHTML = `<div class="parity-empty">WebGPU unavailable in this browser</div>`;
+          }
+        }
       }
     },
     getState() {
