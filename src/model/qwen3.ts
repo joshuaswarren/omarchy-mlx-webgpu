@@ -13,6 +13,7 @@ import type {
   DispatchBatching,
   DispatchEvent,
   FaultConfig,
+  GpuTokenChain,
   KernelId,
   OptFlags,
   QmmPrecision,
@@ -37,6 +38,7 @@ export interface ExecutionTuning {
   useSubgroups: boolean;
   dispatchBatching: DispatchBatching;
   decodePacing: DecodePacing;
+  gpuTokenChain: GpuTokenChain;
 }
 
 const DEFAULT_EXEC_TUNING: ExecutionTuning = {
@@ -45,11 +47,14 @@ const DEFAULT_EXEC_TUNING: ExecutionTuning = {
   useSubgroups: false,
   dispatchBatching: "single_pass",
   decodePacing: "every_token",
+  gpuTokenChain: 1,
 };
 
 const MAX_SEQ = 512;
 const SDPA_SPLIT_BK = 64;
 const SDPA_MAX_BLOCKS = Math.ceil(MAX_SEQ / SDPA_SPLIT_BK);
+const MAX_GPU_CHAIN = 4;
+const CHAIN_UNIFORM_STRIDE = 256;
 
 interface LayerBindGroups {
   inNorm: GPUBindGroup;
@@ -94,6 +99,7 @@ export class Qwen3WebGpuEngine {
     sdpaSplitP1: GPUComputePipeline;
     sdpaSplitP2: GPUComputePipeline;
     embedQ4: GPUComputePipeline;
+    embedQ4Indirect: GPUComputePipeline;
     residualAdd: GPUComputePipeline;
     kvCacheWrite: GPUComputePipeline;
     argmaxP1: GPUComputePipeline;
@@ -134,6 +140,9 @@ export class Qwen3WebGpuEngine {
   private readonly amaxOutVal: GPUBuffer;
   private readonly readbackIdx: GPUBuffer;
   private readonly readbackSlice: GPUBuffer;
+  private readonly chainTokenIn: GPUBuffer;
+  private readonly readbackChain: GPUBuffer;
+  private readonly chainUniformStaging: GPUBuffer;
 
   private readonly kCaches: GPUBuffer[];
   private readonly vCaches: GPUBuffer[];
@@ -161,6 +170,7 @@ export class Qwen3WebGpuEngine {
 
   // Static bind groups (zero per-token allocation!)
   private readonly bgEmbed: GPUBindGroup;
+  private readonly bgEmbedIndirect: GPUBindGroup;
   private readonly bgFinalNorm: GPUBindGroup;
   private readonly bgLmHead: GPUBindGroup;
   private readonly bgArgmaxP1: GPUBindGroup;
@@ -238,6 +248,21 @@ export class Qwen3WebGpuEngine {
       label: "readbackSlice",
       size: 64 * 4,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    this.chainTokenIn = device.createBuffer({
+      label: "chainTokenIn",
+      size: 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.readbackChain = device.createBuffer({
+      label: "readbackChain",
+      size: MAX_GPU_CHAIN * 4,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    this.chainUniformStaging = device.createBuffer({
+      label: "chainUniformStaging",
+      size: MAX_GPU_CHAIN * CHAIN_UNIFORM_STRIDE,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
     const kvBytes = KV * MAX_SEQ * D * 4;
@@ -328,6 +353,18 @@ export class Qwen3WebGpuEngine {
         { binding: 2, resource: { buffer: weights.embed.biases } },
         { binding: 3, resource: { buffer: this.xA } },
         { binding: 4, resource: { buffer: this.uEmbed } },
+      ],
+    });
+
+    this.bgEmbedIndirect = device.createBindGroup({
+      layout: pipelines.embedQ4Indirect.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: weights.embed.weight } },
+        { binding: 1, resource: { buffer: weights.embed.scales } },
+        { binding: 2, resource: { buffer: weights.embed.biases } },
+        { binding: 3, resource: { buffer: this.xA } },
+        { binding: 4, resource: { buffer: this.uEmbed } },
+        { binding: 22, resource: { buffer: this.chainTokenIn } },
       ],
     });
 
@@ -597,6 +634,7 @@ export class Qwen3WebGpuEngine {
         sdpaSplitP1: mkPipe(sdpaSplitP1Mod),
         sdpaSplitP2: mkPipe(sdpaSplitP2Mod),
         embedQ4: mkPipe(elemMod, "embed_q4"),
+        embedQ4Indirect: mkPipe(elemMod, "embed_q4_indirect"),
         residualAdd: mkPipe(elemMod, "residual_add"),
         kvCacheWrite: mkPipe(elemMod, "kv_cache_write"),
         argmaxP1: mkPipe(elemMod, "argmax_p1"),
@@ -660,42 +698,89 @@ export class Qwen3WebGpuEngine {
     return { qmmVec, qmmVecSwiglu, sdpaOnline };
   }
 
-  private writeStepUniforms(tokenId: number, pos: number, fault: FaultConfig): number {
-    const { hiddenSize: H, numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, intermediateSize: I, vocabSize: V, rmsNormEps: eps, ropeTheta, groupSize } = this.config;
+  private writeFaultUniformsIfChanged(fault: FaultConfig): void {
+    const { hiddenSize: H, numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, intermediateSize: I, vocabSize: V, rmsNormEps: eps, groupSize } = this.config;
     const qDim = Q * D;
     const kvDim = KV * D;
+    const target = fault.target ?? "attention";
+    const normFault = fault.enabled && target === "norm" ? 1 : 0;
+    const qmmFault = fault.enabled && target === "qmm" ? 1 : 0;
+
+    // Only rewrite norm/QMM uniforms when fault state actually changes (zero steady-state overhead)
+    const faultKey = fault.enabled ? target : "off";
+    if (faultKey === this.lastFaultKey) return;
+    this.lastFaultKey = faultKey;
+
+    const writeNorm = (buf: GPUBuffer, rows: number, rowLen: number, fVal: number) => {
+      const ab = new ArrayBuffer(32);
+      const u = new Uint32Array(ab); const f = new Float32Array(ab);
+      u[0] = rows; u[1] = rowLen; u[2] = 0; u[3] = fVal; f[4] = eps;
+      this.device.queue.writeBuffer(buf, 0, new Uint8Array(ab));
+    };
+    writeNorm(this.uNormHidden, 1, H, normFault);
+    writeNorm(this.uNormQ, Q, D, normFault);
+    writeNorm(this.uNormK, KV, D, normFault);
+
+    const writeQmm = (buf: GPUBuffer, n: number, k: number, fVal: number) => {
+      this.device.queue.writeBuffer(buf, 0, new Uint32Array([n, k, groupSize, fVal, 0, 0, 0, 0]));
+    };
+    writeQmm(this.uQmmQ, qDim, H, qmmFault);
+    writeQmm(this.uQmmKV, kvDim, H, qmmFault);
+    writeQmm(this.uQmmO, H, qDim, qmmFault);
+    writeQmm(this.uQmmGateUp, I, H, qmmFault);
+    writeQmm(this.uQmmDown, H, I, qmmFault);
+    writeQmm(this.uQmmLmHead, V, H, qmmFault);
+  }
+
+  private packPosUniforms(out: Uint8Array, base: number, pos: number, fault: FaultConfig): number {
+    const { numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, rmsNormEps: eps, ropeTheta } = this.config;
     const kLen = pos + 1;
     const nblocks = Math.max(1, Math.ceil(kLen / SDPA_SPLIT_BK));
     const target = fault.target ?? "attention";
     const attnFault = fault.enabled && target === "attention" ? 1 : 0;
     const ropeFault = fault.enabled && target === "rope" ? 1 : 0;
     const normFault = fault.enabled && target === "norm" ? 1 : 0;
-    const qmmFault = fault.enabled && target === "qmm" ? 1 : 0;
 
-    // Only rewrite norm/QMM uniforms when fault state actually changes (zero steady-state overhead)
-    const faultKey = fault.enabled ? target : "off";
-    if (faultKey !== this.lastFaultKey) {
-      this.lastFaultKey = faultKey;
-      const writeNorm = (buf: GPUBuffer, rows: number, rowLen: number, fVal: number) => {
-        const ab = new ArrayBuffer(32);
-        const u = new Uint32Array(ab); const f = new Float32Array(ab);
-        u[0] = rows; u[1] = rowLen; u[2] = 0; u[3] = fVal; f[4] = eps;
-        this.device.queue.writeBuffer(buf, 0, new Uint8Array(ab));
-      };
-      writeNorm(this.uNormHidden, 1, H, normFault);
-      writeNorm(this.uNormQ, Q, D, normFault);
-      writeNorm(this.uNormK, KV, D, normFault);
+    const writeRope = (off: number, heads: number) => {
+      const ab = new ArrayBuffer(32);
+      const u = new Uint32Array(ab); const f = new Float32Array(ab);
+      u[0] = heads; u[1] = D; u[2] = pos; u[3] = ropeFault; f[4] = ropeTheta; f[5] = 1.0;
+      out.set(new Uint8Array(ab), base + off);
+    };
+    const writeRopeNorm = (off: number, heads: number) => {
+      const ab = new ArrayBuffer(32);
+      const u = new Uint32Array(ab); const f = new Float32Array(ab);
+      u[0] = heads; u[1] = D; u[2] = pos; u[3] = 0; f[4] = eps; f[5] = ropeTheta; f[6] = 1.0; u[7] = ropeFault || normFault ? 1 : 0;
+      out.set(new Uint8Array(ab), base + off);
+    };
 
-      const writeQmm = (buf: GPUBuffer, n: number, k: number, fVal: number) => {
-        this.device.queue.writeBuffer(buf, 0, new Uint32Array([n, k, groupSize, fVal, 0, 0, 0, 0]));
-      };
-      writeQmm(this.uQmmQ, qDim, H, qmmFault);
-      writeQmm(this.uQmmKV, kvDim, H, qmmFault);
-      writeQmm(this.uQmmO, H, qDim, qmmFault);
-      writeQmm(this.uQmmGateUp, I, H, qmmFault);
-      writeQmm(this.uQmmDown, H, I, qmmFault);
-      writeQmm(this.uQmmLmHead, V, H, qmmFault);
-    }
+    writeRope(0, Q);
+    writeRope(32, KV);
+    writeRopeNorm(64, Q);
+    writeRopeNorm(96, KV);
+    out.set(new Uint8Array(new Uint32Array([KV, D, MAX_SEQ, pos]).buffer), base + 128);
+
+    const sdpaAb = new ArrayBuffer(32);
+    const su = new Uint32Array(sdpaAb); const sf = new Float32Array(sdpaAb);
+    su[0] = Q; su[1] = KV; su[2] = kLen; su[3] = MAX_SEQ;
+    sf[4] = 1 / Math.sqrt(D); su[5] = attnFault; su[6] = nblocks;
+    const sdpaBytes = new Uint8Array(sdpaAb);
+    out.set(sdpaBytes, base + 144);
+    out.set(sdpaBytes, base + 176);
+
+    return nblocks;
+  }
+
+  private writeStepUniforms(tokenId: number, pos: number, fault: FaultConfig): number {
+    const { hiddenSize: H, numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, rmsNormEps: eps, ropeTheta, groupSize } = this.config;
+    const kLen = pos + 1;
+    const nblocks = Math.max(1, Math.ceil(kLen / SDPA_SPLIT_BK));
+    const target = fault.target ?? "attention";
+    const attnFault = fault.enabled && target === "attention" ? 1 : 0;
+    const ropeFault = fault.enabled && target === "rope" ? 1 : 0;
+    const normFault = fault.enabled && target === "norm" ? 1 : 0;
+
+    this.writeFaultUniformsIfChanged(fault);
 
     this.device.queue.writeBuffer(this.uEmbed, 0, new Uint32Array([tokenId, H, groupSize, 0]));
 
@@ -729,32 +814,26 @@ export class Qwen3WebGpuEngine {
     return nblocks;
   }
 
-  /**
-   * Executes one full 28-layer token step using the requested execution levers
-   * (variant QMM workgroup size / f16 / subgroups, pass/submit batching).
-   */
-  async forwardStep(
-    tokenId: number,
+  private encodeStepPass(
+    encIn: GPUCommandEncoder,
     pos: number,
+    nblocks: number,
     opts: OptFlags,
-    fault: FaultConfig,
+    exec: ExecutionTuning,
+    variants: { qmmVec: GPUComputePipeline; qmmVecSwiglu: GPUComputePipeline; sdpaOnline: GPUComputePipeline },
+    useIndirectEmbed: boolean,
     computeLogits: boolean,
     recordTrace: boolean,
-    exec: ExecutionTuning = DEFAULT_EXEC_TUNING,
-  ): Promise<{
-    nextTokenId: number;
+  ): {
+    enc: GPUCommandEncoder;
     dispatches: DispatchEvent[];
     totalDispatches: number;
     attentionDispatches: number;
-    sampleSlice?: Float32Array;
-  }> {
+  } {
     const { hiddenSize: H, numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, intermediateSize: I, vocabSize: V, numHiddenLayers: L, groupSize } = this.config;
     const qDim = Q * D;
     const kvDim = KV * D;
-    const nblocks = this.writeStepUniforms(tokenId, pos, fault);
     const kLen = pos + 1;
-
-    const variants = await this.resolveVariantPipelines(exec);
     const wgQmm: [number, number, number] = [exec.qmmWorkgroupSize, 1, 1];
 
     const dispatches: DispatchEvent[] = [];
@@ -762,7 +841,7 @@ export class Qwen3WebGpuEngine {
     let attentionDispatches = 0;
     const q4Bytes = (n: number, k: number) => Math.round(n * k * 0.5 + n * (k / groupSize) * 8);
 
-    let enc = this.device.createCommandEncoder({ label: `step_${pos}_0` });
+    let enc = encIn;
     let pass = enc.beginComputePass({ label: `qwen3_step_${pos}_0` });
 
     const splitPass = (tag: string) => {
@@ -812,8 +891,18 @@ export class Qwen3WebGpuEngine {
     const gI = qmmDispatchGridForWg(I, exec.qmmWorkgroupSize);
     const gV = qmmDispatchGridForWg(V, exec.qmmWorkgroupSize);
 
-    // Token embedding
-    run(-1, "embed_q4", "embed_tokens (4-bit)", this.pipelines.embedQ4, this.bgEmbed, [Math.ceil(H / 256), 1, 1], [256, 1, 1], q4Bytes(1, H), H * 4);
+    // Token embedding (indirect reads previous token ID directly from GPU memory)
+    run(
+      -1,
+      "embed_q4",
+      useIndirectEmbed ? "embed_tokens (4-bit, GPU-chained)" : "embed_tokens (4-bit)",
+      useIndirectEmbed ? this.pipelines.embedQ4Indirect : this.pipelines.embedQ4,
+      useIndirectEmbed ? this.bgEmbedIndirect : this.bgEmbed,
+      [Math.ceil(H / 256), 1, 1],
+      [256, 1, 1],
+      q4Bytes(1, H),
+      H * 4,
+    );
 
     // 28 transformer layers
     for (let l = 0; l < L; l++) {
@@ -881,6 +970,42 @@ export class Qwen3WebGpuEngine {
     }
 
     pass.end();
+    return { enc, dispatches, totalDispatches, attentionDispatches };
+  }
+
+  /**
+   * Executes one full 28-layer token step using the requested execution levers
+   * (variant QMM workgroup size / f16 / subgroups, pass/submit batching).
+   */
+  async forwardStep(
+    tokenId: number,
+    pos: number,
+    opts: OptFlags,
+    fault: FaultConfig,
+    computeLogits: boolean,
+    recordTrace: boolean,
+    exec: ExecutionTuning = DEFAULT_EXEC_TUNING,
+  ): Promise<{
+    nextTokenId: number;
+    dispatches: DispatchEvent[];
+    totalDispatches: number;
+    attentionDispatches: number;
+    sampleSlice?: Float32Array;
+  }> {
+    const nblocks = this.writeStepUniforms(tokenId, pos, fault);
+    const variants = await this.resolveVariantPipelines(exec);
+    const enc0 = this.device.createCommandEncoder({ label: `step_${pos}_0` });
+    const { enc, dispatches, totalDispatches, attentionDispatches } = this.encodeStepPass(
+      enc0,
+      pos,
+      nblocks,
+      opts,
+      exec,
+      variants,
+      false,
+      computeLogits,
+      recordTrace,
+    );
 
     if (!computeLogits) {
       this.device.queue.submit([enc.finish()]);
@@ -905,6 +1030,79 @@ export class Qwen3WebGpuEngine {
     }
 
     return { nextTokenId, dispatches, totalDispatches, attentionDispatches, sampleSlice };
+  }
+
+  /**
+   * Chains `count` (2..4) autoregressive decode steps in a single GPU submission by
+   * feeding each step's argmax token ID directly into `embed_q4_indirect` on-device,
+   * cutting Chromium CPU-GPU `mapAsync` sync roundtrips by up to 4x with exact parity.
+   */
+  async forwardStepChain(
+    firstTokenId: number,
+    startPos: number,
+    count: number,
+    opts: OptFlags,
+    fault: FaultConfig,
+    exec: ExecutionTuning,
+  ): Promise<{
+    tokenIds: number[];
+    totalDispatches: number;
+    attentionDispatches: number;
+  }> {
+    const kCount = Math.max(1, Math.min(MAX_GPU_CHAIN, count));
+    const { hiddenSize: H, groupSize } = this.config;
+    this.writeFaultUniformsIfChanged(fault);
+    this.device.queue.writeBuffer(this.uEmbed, 0, new Uint32Array([firstTokenId, H, groupSize, 0]));
+
+    const staging = new Uint8Array(kCount * CHAIN_UNIFORM_STRIDE);
+    const nblocksList: number[] = [];
+    for (let k = 0; k < kCount; k++) {
+      nblocksList.push(this.packPosUniforms(staging, k * CHAIN_UNIFORM_STRIDE, startPos + k, fault));
+    }
+    this.device.queue.writeBuffer(this.chainUniformStaging, 0, staging);
+
+    const variants = await this.resolveVariantPipelines(exec);
+    let enc = this.device.createCommandEncoder({ label: `chain_${startPos}_${kCount}` });
+    let lastDispatches = 0;
+    let lastAttn = 0;
+
+    for (let k = 0; k < kCount; k++) {
+      const base = k * CHAIN_UNIFORM_STRIDE;
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 0, this.uRopeQ, 0, 32);
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 32, this.uRopeK, 0, 32);
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 64, this.uRopeNormQ, 0, 32);
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 96, this.uRopeNormK, 0, 32);
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 128, this.uKvWrite, 0, 16);
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 144, this.uSdpaOnline, 0, 32);
+      enc.copyBufferToBuffer(this.chainUniformStaging, base + 176, this.uSdpaSplit, 0, 32);
+
+      const stepRes = this.encodeStepPass(
+        enc,
+        startPos + k,
+        nblocksList[k],
+        opts,
+        exec,
+        variants,
+        k > 0,
+        true,
+        false,
+      );
+      enc = stepRes.enc;
+      lastDispatches = stepRes.totalDispatches;
+      lastAttn = stepRes.attentionDispatches;
+
+      enc.copyBufferToBuffer(this.amaxOutIdx, 0, this.readbackChain, k * 4, 4);
+      if (k + 1 < kCount) {
+        enc.copyBufferToBuffer(this.amaxOutIdx, 0, this.chainTokenIn, 0, 4);
+      }
+    }
+
+    this.device.queue.submit([enc.finish()]);
+    await this.readbackChain.mapAsync(GPUMapMode.READ);
+    const tokenIds = Array.from(new Uint32Array(this.readbackChain.getMappedRange(0, kCount * 4)));
+    this.readbackChain.unmap();
+
+    return { tokenIds, totalDispatches: lastDispatches, attentionDispatches: lastAttn };
   }
 
   /**
@@ -952,14 +1150,13 @@ export class Qwen3WebGpuEngine {
     const decodeWallStart = performance.now();
     let compileOverheadMs = 0;
 
-    for (let step = 0; step < budget; step++) {
+    let step = 0;
+    let hitEos = false;
+    while (step < budget && !hitEos) {
       if (shouldStop()) break;
       const opts = { ...getOpts() };
       const fault = { ...getFault() };
       const exec = resolveExec();
-      const wantTrace =
-        exec.decodePacing === "every_token" ||
-        (exec.decodePacing === "every_4" && (step === 0 || step % 4 === 3));
 
       // Pre-compile variant pipelines before timing this token so mid-generation lever flips
       // never include WGSL compilation latency in tokenMs or avgTokPerSec.
@@ -967,13 +1164,69 @@ export class Qwen3WebGpuEngine {
       await this.resolveVariantPipelines(exec);
       compileOverheadMs += performance.now() - compileStart;
 
+      const remaining = budget - step;
+      const chainLen =
+        exec.gpuTokenChain > 1 && remaining > 1
+          ? Math.min(exec.gpuTokenChain, remaining, MAX_SEQ - pos - 1)
+          : 1;
+
+      if (chainLen > 1) {
+        const t0 = performance.now();
+        const chainRes = await this.forwardStepChain(curToken, pos, chainLen, opts, fault, exec);
+        const batchMs = Math.max(0.01, performance.now() - t0);
+        const perTokMs = batchMs / chainLen;
+        lastDispatchesPerTok = chainRes.totalDispatches;
+
+        for (let k = 0; k < chainRes.tokenIds.length; k++) {
+          const nextId = chainRes.tokenIds[k];
+          if (eosSet.has(nextId)) {
+            hitEos = true;
+            break;
+          }
+          generated.push(nextId);
+          const fullDecoded = this.tokenizer.decode(generated, true);
+          const deltaText = fullDecoded.slice(decodedSoFar.length);
+          decodedSoFar = fullDecoded;
+
+          onToken({
+            step,
+            tokenId: nextId,
+            text: deltaText,
+            tokenMs: perTokMs,
+            tokPerSec: 1000 / perTokMs,
+            totalDispatches: chainRes.totalDispatches,
+            attentionDispatches: chainRes.attentionDispatches,
+            optFlags: opts,
+            faultEnabled: fault.enabled,
+            faultTarget: fault.target ?? "attention",
+            dispatches: [],
+          });
+
+          curToken = nextId;
+          pos += 1;
+          step += 1;
+        }
+
+        if (!hitEos && exec.decodePacing !== "unthrottled") {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        continue;
+      }
+
+      const wantTrace =
+        exec.decodePacing === "every_token" ||
+        (exec.decodePacing === "every_4" && (step === 0 || step % 4 === 3));
+
       const t0 = performance.now();
       const res = await this.forwardStep(curToken, pos, opts, fault, true, wantTrace, exec);
       const tokenMs = Math.max(0.01, performance.now() - t0);
       lastDispatchesPerTok = res.totalDispatches;
 
       const nextId = res.nextTokenId;
-      if (eosSet.has(nextId)) break;
+      if (eosSet.has(nextId)) {
+        hitEos = true;
+        break;
+      }
 
       generated.push(nextId);
       const fullDecoded = this.tokenizer.decode(generated, true);
@@ -997,9 +1250,10 @@ export class Qwen3WebGpuEngine {
 
       curToken = nextId;
       pos += 1;
+      step += 1;
       if (exec.decodePacing === "every_token") {
         await new Promise((r) => setTimeout(r, 0));
-      } else if (exec.decodePacing === "every_4" && step % 4 === 3) {
+      } else if (exec.decodePacing === "every_4" && step % 4 === 0) {
         await new Promise((r) => setTimeout(r, 0));
       }
     }
@@ -1020,6 +1274,7 @@ export class Qwen3WebGpuEngine {
       this.sdpaScratch, this.oOut, this.gateBuf, this.upBuf, this.mlpAct,
       this.downOut, this.logitsBuf, this.amaxVals, this.amaxIdxs,
       this.amaxOutIdx, this.amaxOutVal, this.readbackIdx, this.readbackSlice,
+      this.chainTokenIn, this.readbackChain, this.chainUniformStaging,
       this.uEmbed, this.uNormHidden, this.uNormQ, this.uNormK,
       this.uQmmQ, this.uQmmKV, this.uQmmO, this.uQmmGateUp, this.uQmmDown, this.uQmmLmHead,
       this.uRopeQ, this.uRopeK, this.uRopeNormQ, this.uRopeNormK,

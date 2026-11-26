@@ -2,6 +2,7 @@ import type {
   DecodePacing,
   DispatchBatching,
   GpuAdapterInfo,
+  GpuTokenChain,
   QmmPrecision,
   QmmWorkgroupSize,
   TuningConfig,
@@ -305,7 +306,9 @@ export function createTuningLabView(
                 ? val
                   ? "ON"
                   : "OFF"
-                : String(val).replaceAll("_", " ");
+                : spec.key === "gpuTokenChain"
+                  ? `${val} tok`
+                  : String(val).replaceAll("_", " ");
             return `<button
               type="button"
               class="tl-pill${active ? " is-active" : ""}${!supported ? " is-unsupported" : ""}"
@@ -339,6 +342,7 @@ export function createTuningLabView(
         else if (key === "qmmPrecision") parsed = raw as QmmPrecision;
         else if (key === "dispatchBatching") parsed = raw as DispatchBatching;
         else if (key === "decodePacing") parsed = raw as DecodePacing;
+        else if (key === "gpuTokenChain") parsed = Number(raw) as GpuTokenChain;
         handlers.onConfigChange({ [key]: parsed } as Partial<TuningConfig>);
       });
     });
@@ -373,8 +377,12 @@ export function createTuningLabView(
               : h.status === "baseline"
                 ? "is-base"
                 : "is-drop";
+        const trialNote =
+          h.trialScores && h.trialScores.length > 1
+            ? ` | median of ${h.trialScores.length}: [${h.trialScores.map((s) => s.toFixed(1)).join(", ")}] tok/s`
+            : "";
         return `
-          <tr class="tl-row${isBest ? " is-best" : ""}" data-tl-row="${idx}" title="Click to load this config">
+          <tr class="tl-row${isBest ? " is-best" : ""}" data-tl-row="${idx}" title="Click to load this config${escapeHtml(trialNote)}">
             <td class="tabular">${h.step}</td>
             <td class="mono">${escapeHtml(h.label)}</td>
             <td class="tabular">${h.dispatchesPerTok}</td>

@@ -13,6 +13,7 @@ import {
   configKey,
   encodeConfigToUrl,
   getLeverSpecs,
+  medianNumber,
   normalizeTuningConfig,
   parseTuningUrl,
   scoreTuningRun,
@@ -115,13 +116,16 @@ describe("Tuning Lab config, URL share links, and parity-gated scoring", () => {
       useSubgroups: true,
       dispatchBatching: "single_pass",
       decodePacing: "unthrottled",
+      gpuTokenChain: 4,
     };
     const url = encodeConfigToUrl(cfg, "https://joshuaswarren.github.io/omarchy-mlx-webgpu/");
+    expect(url).toContain("chain=4");
     const parsed = parseTuningUrl(new URL(url).search);
     expect(parsed.openTuningTab).toBe(true);
     expect(parsed.hasTuningParams).toBe(true);
     expect(parsed.prompt).toBeUndefined();
     const roundTripped = normalizeTuningConfig(parsed.patch, METAL_ADAPTER);
+    expect(roundTripped.gpuTokenChain).toBe(4);
     expect(configKey(roundTripped)).toBe(configKey(cfg));
 
     const customPrompt = "Explain RMSNorm in one sentence.";
@@ -296,6 +300,49 @@ describe("Coordinate-ascent hill climber", () => {
     const base537 = mkEval(0, "Start baseline", 537, 80.0, true);
     const msgFast = summarizeTrajectoryInsight([base537, best397], best397);
     expect(msgFast).toContain("cutting dispatches to 397/tok was also fastest (130.0 tok/s");
+  });
+
+  it("computes medians cleanly and enforces minGainPct noise floor in hill climbing", async () => {
+    expect(medianNumber([133.7, 106.7, 120.7])).toBe(120.7);
+    expect(medianNumber([10, 40, 20, 30])).toBe(25);
+    expect(medianNumber([])).toBe(0);
+
+    const refTokens = [4, 5, 6];
+    const report = await runCoordinateHillClimb({
+      prompt: "noise",
+      tokenBudget: 3,
+      startConfig: BASELINE_TUNING_CONFIG,
+      adapter: BASIC_ADAPTER,
+      referenceTokens: refTokens,
+      minGainPct: 2.0,
+      evaluate: async (cfg, label, step) => {
+        // Tiny +0.5% jitter on oneDispatchAttention must be rejected under 2% noise floor,
+        // while real +40% gain on gpuTokenChain=4 must be accepted!
+        let tps = 100.0;
+        if (cfg.oneDispatchAttention) tps += 0.5;
+        if (cfg.gpuTokenChain === 4) tps += 40.0;
+        const scored = scoreTuningRun({ tokens: refTokens, refTokens, avgTokPerSec: tps });
+        return {
+          step,
+          label,
+          config: cfg,
+          configKey: configKey(cfg),
+          tokPerSec: tps,
+          msPerTok: 1000 / tps,
+          dispatchesPerTok: 537,
+          tokens: [...refTokens],
+          text: "ok",
+          ...scored,
+          status: "manual",
+          shareUrl: encodeConfigToUrl(cfg, "https://example.test/"),
+          timestampMs: Date.now(),
+        };
+      },
+    });
+
+    expect(report.best.config.gpuTokenChain).toBe(4);
+    expect(report.best.config.oneDispatchAttention).toBe(false);
+    expect(report.best.score).toBe(140);
   });
 
   it("throws WebGpuUnavailableError when navigator.gpu is missing", async () => {

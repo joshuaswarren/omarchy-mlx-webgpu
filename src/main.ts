@@ -20,6 +20,7 @@ import {
   configKey,
   encodeConfigToUrl,
   getLeverSpecs,
+  medianNumber,
   normalizeTuningConfig,
   parseTuningUrl,
   scoreTuningRun,
@@ -64,12 +65,15 @@ export interface OmarchyLabApi {
     prompt?: string;
     tokens?: number;
     label?: string;
+    trials?: number;
   }) => Promise<TuningEvalResult>;
   hillClimb: (options?: {
     start?: "baseline" | "current";
     prompt?: string;
     tokens?: number;
     maxPasses?: number;
+    trials?: number;
+    minGainPct?: number;
   }) => Promise<HillClimbReport>;
   read: () => {
     adapter: GpuAdapterInfo | null;
@@ -159,6 +163,7 @@ function toExecTuning(c: TuningConfig): ExecutionTuning {
     useSubgroups: c.useSubgroups,
     dispatchBatching: c.dispatchBatching,
     decodePacing: c.decodePacing,
+    gpuTokenChain: c.gpuTokenChain,
   };
 }
 
@@ -313,12 +318,14 @@ async function boot() {
     tokenBudget: number,
     label: string,
     step: number,
+    requestedTrials = 1,
   ): Promise<TuningEvalResult> => {
     const eng = await ensureEngine();
     const refTokens = await ensureReferenceTokens(prompt, tokenBudget);
     const normalized = normalizeTuningConfig(cfg, gpu?.info ?? null);
+    const maxTrials = Math.max(1, Math.min(5, Math.floor(requestedTrials)));
 
-    // 2-token silent warmup on the candidate pipelines so compile/clock warmup never biases speed
+    // 2-token silent warmup on the candidate pipelines + queue drain so compile/clock warmup never biases speed
     await eng.generate(
       prompt,
       2,
@@ -328,40 +335,75 @@ async function boot() {
       () => stopRequested,
       () => toExecTuning(normalized),
     );
+    await gpu?.device.queue.onSubmittedWorkDone();
 
-    const out = await eng.generate(
-      prompt,
-      tokenBudget,
-      () => toOptFlags(normalized),
-      () => toFaultConfig(normalized),
-      () => {},
-      () => stopRequested,
-      () => toExecTuning(normalized),
-    );
+    const trialSpeeds: number[] = [];
+    let allTrialsPass = true;
+    let firstOut: Awaited<ReturnType<Qwen3WebGpuEngine["generate"]>> | null = null;
+    let failingOut: Awaited<ReturnType<Qwen3WebGpuEngine["generate"]>> | null = null;
 
+    for (let t = 0; t < maxTrials; t++) {
+      if (t > 0 && stopRequested) break;
+      const tStart = performance.now();
+      const out = await eng.generate(
+        prompt,
+        tokenBudget,
+        () => toOptFlags(normalized),
+        () => toFaultConfig(normalized),
+        () => {},
+        () => stopRequested,
+        () => toExecTuning(normalized),
+      );
+      await gpu?.device.queue.onSubmittedWorkDone();
+      const trialMs = performance.now() - tStart;
+
+      if (!firstOut) firstOut = out;
+      const trialScored = scoreTuningRun({
+        tokens: out.tokens,
+        refTokens,
+        avgTokPerSec: out.avgTokPerSec,
+      });
+      trialSpeeds.push(Number(out.avgTokPerSec.toFixed(2)));
+      if (!trialScored.parityPass) {
+        allTrialsPass = false;
+        failingOut = out;
+        break;
+      }
+
+      // Adaptive guard: only repeat trials on fast hardware GPUs (< 800 ms/trial) so software adapters stay crisp
+      if (t === 0 && trialMs > 800) {
+        break;
+      }
+    }
+
+    const repOut = failingOut ?? firstOut!;
+    const medianTps = medianNumber(trialSpeeds);
     const scored = scoreTuningRun({
-      tokens: out.tokens,
+      tokens: repOut.tokens,
       refTokens,
-      avgTokPerSec: out.avgTokPerSec,
+      avgTokPerSec: medianTps,
     });
+    const parityPass = allTrialsPass && scored.parityPass;
 
     return {
       step,
       label,
       config: normalized,
       configKey: configKey(normalized),
-      tokPerSec: Number(out.avgTokPerSec.toFixed(2)),
-      msPerTok: out.avgTokPerSec > 0 ? Number((1000 / out.avgTokPerSec).toFixed(2)) : 0,
-      dispatchesPerTok: out.dispatchesPerTok,
-      tokens: out.tokens,
-      text: out.text,
+      tokPerSec: Number(medianTps.toFixed(2)),
+      msPerTok: medianTps > 0 ? Number((1000 / medianTps).toFixed(2)) : 0,
+      dispatchesPerTok: repOut.dispatchesPerTok,
+      tokens: repOut.tokens,
+      text: repOut.text,
       parityMatched: scored.parityMatched,
       parityTotal: scored.parityTotal,
-      parityPass: scored.parityPass,
-      score: scored.score,
-      status: scored.parityPass ? "manual" : "parity_fail",
+      parityPass,
+      score: parityPass ? scored.score : 0,
+      status: parityPass ? "manual" : "parity_fail",
       shareUrl: encodeConfigToUrl(normalized, pageOriginPath, true, getCustomPrompt(prompt)),
       timestampMs: Date.now(),
+      trials: trialSpeeds.length,
+      trialScores: trialSpeeds,
     };
   };
 
@@ -370,6 +412,7 @@ async function boot() {
     prompt?: string;
     tokens?: number;
     label?: string;
+    trials?: number;
   }): Promise<TuningEvalResult> => {
     stopRequested = false;
     if (options?.prompt !== undefined) {
@@ -377,6 +420,7 @@ async function boot() {
     }
     const prompt = ui.getPrompt();
     const tokenBudget = options?.tokens ?? 24;
+    const trials = options?.trials ?? 1;
     if (options?.config) {
       applyTuningPatch(options.config, true);
     }
@@ -386,13 +430,14 @@ async function boot() {
     publishLabState(false);
 
     try {
-      ui.setStatus(`Benchmarking config (${targetCfg.qmmPrecision}, wg=${targetCfg.qmmWorkgroupSize}, ${targetCfg.dispatchBatching})…`, "busy");
+      ui.setStatus(`Benchmarking config (${targetCfg.qmmPrecision}, wg=${targetCfg.qmmWorkgroupSize}, chain=${targetCfg.gpuTokenChain}, ${targetCfg.dispatchBatching})…`, "busy");
       const res = await evaluateTuningConfig(
         targetCfg,
         prompt,
         tokenBudget,
-        options?.label ?? `manual (${targetCfg.qmmPrecision}, wg=${targetCfg.qmmWorkgroupSize})`,
+        options?.label ?? `manual (${targetCfg.qmmPrecision}, wg=${targetCfg.qmmWorkgroupSize}, chain=${targetCfg.gpuTokenChain})`,
         manualStepCounter++,
+        trials,
       );
       lastEval = res;
       evalHistory.push(res);
@@ -421,6 +466,8 @@ async function boot() {
     prompt?: string;
     tokens?: number;
     maxPasses?: number;
+    trials?: number;
+    minGainPct?: number;
   }): Promise<HillClimbReport> => {
     stopRequested = false;
     if (options?.prompt !== undefined) {
@@ -428,6 +475,8 @@ async function boot() {
     }
     const prompt = ui.getPrompt();
     const tokenBudget = options?.tokens ?? 24;
+    const trials = options?.trials ?? 3;
+    const minGainPct = options?.minGainPct ?? 1.0;
     const startMode = options?.start ?? "baseline";
     const startCfg =
       startMode === "current"
@@ -450,10 +499,11 @@ async function boot() {
         adapter: gpu?.info ?? null,
         referenceTokens: refTokens,
         maxPasses: options?.maxPasses,
+        minGainPct,
         evaluate: async (cfg, label, step) => {
           applyTuningPatch(cfg, false);
-          ui.setStatus(`Hill Climb step ${step}: testing ${label}…`, "busy");
-          return evaluateTuningConfig(cfg, prompt, tokenBudget, label, step);
+          ui.setStatus(`Hill Climb step ${step}: testing ${label} (median of ${trials})…`, "busy");
+          return evaluateTuningConfig(cfg, prompt, tokenBudget, label, step, trials);
         },
         onStep: (stepRes, best, allSteps) => {
           lastEval = stepRes;

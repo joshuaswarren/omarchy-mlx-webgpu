@@ -14,6 +14,8 @@ export interface HillClimbOptions {
   referenceTokens: number[];
   /** Maximum coordinate-ascent sweeps over all levers (default 2; stops early once a pass finds no gain). */
   maxPasses?: number;
+  /** Minimum relative score improvement (%) required to accept a candidate (default 0; live GPU climbs pass ~1%). */
+  minGainPct?: number;
   evaluate: (
     config: TuningConfig,
     label: string,
@@ -38,6 +40,7 @@ export async function runCoordinateHillClimb(
 ): Promise<HillClimbReport> {
   const { prompt, tokenBudget, adapter, referenceTokens, evaluate, onStep, shouldStop } = opts;
   const maxPasses = Math.max(1, Math.min(4, Math.floor(opts.maxPasses ?? 2)));
+  const minGainPct = Math.max(0, opts.minGainPct ?? 0);
   const steps: TuningEvalResult[] = [];
   const visited = new Set<string>();
 
@@ -55,10 +58,11 @@ export async function runCoordinateHillClimb(
   onStep?.(baseline, best, [...steps]);
 
   const specs = getLeverSpecs(adapter);
-  // Order levers: lift browser timer-yield bottleneck first so every GPU kernel
-  // lever is measured cleanly GPU-bound, then structural fusions -> micro-arch.
+  // Order levers: lift browser timer-yield & CPU-GPU IPC bottlenecks first so every GPU
+  // kernel lever is measured cleanly GPU-bound, then structural fusions -> micro-arch.
   const leverOrder: Array<keyof TuningConfig> = [
     "decodePacing",
+    "gpuTokenChain",
     "dispatchBatching",
     "oneDispatchAttention",
     "fusedRopeNorm",
@@ -112,9 +116,10 @@ export async function runCoordinateHillClimb(
         const raw = await evaluate(candidateCfg, label, stepNum++);
 
         let status: TuningEvalResult["status"];
+        const acceptThreshold = best.score * (1 + minGainPct / 100);
         if (!raw.parityPass) {
           status = "parity_fail";
-        } else if (raw.score > best.score) {
+        } else if (raw.score > acceptThreshold) {
           status = "accepted";
         } else {
           status = "rejected";

@@ -3,6 +3,7 @@ import type {
   DispatchBatching,
   FaultTarget,
   GpuAdapterInfo,
+  GpuTokenChain,
   LeverSpec,
   QmmPrecision,
   QmmWorkgroupSize,
@@ -18,6 +19,7 @@ export const DEFAULT_TUNING_CONFIG: TuningConfig = {
   useSubgroups: false,
   dispatchBatching: "single_pass",
   decodePacing: "every_token",
+  gpuTokenChain: 1,
   faultEnabled: false,
   faultTarget: "attention",
 };
@@ -32,6 +34,7 @@ export const BASELINE_TUNING_CONFIG: TuningConfig = {
   useSubgroups: false,
   dispatchBatching: "chunked_submit",
   decodePacing: "every_token",
+  gpuTokenChain: 1,
   faultEnabled: false,
   faultTarget: "attention",
 };
@@ -46,6 +49,7 @@ export const REFERENCE_TUNING_CONFIG: TuningConfig = {
   useSubgroups: false,
   dispatchBatching: "single_pass",
   decodePacing: "unthrottled",
+  gpuTokenChain: 1,
   faultEnabled: false,
   faultTarget: "attention",
 };
@@ -54,6 +58,7 @@ const VALID_WG: readonly QmmWorkgroupSize[] = [64, 128, 256];
 const VALID_PREC: readonly QmmPrecision[] = ["f32", "f16", "f16_accum"];
 const VALID_BATCH: readonly DispatchBatching[] = ["single_pass", "per_layer_pass", "chunked_submit"];
 const VALID_PACE: readonly DecodePacing[] = ["every_token", "every_4", "unthrottled"];
+const VALID_CHAIN: readonly GpuTokenChain[] = [1, 4];
 const VALID_FAULT_TARGET: readonly FaultTarget[] = ["attention", "qmm", "rope", "norm"];
 
 export function getLeverSpecs(adapter: GpuAdapterInfo | null): LeverSpec[] {
@@ -127,6 +132,14 @@ export function getLeverSpecs(adapter: GpuAdapterInfo | null): LeverSpec[] {
       supportedValues: [...VALID_PACE],
       urlParam: "pace",
     },
+    {
+      key: "gpuTokenChain",
+      label: "On-GPU token chain",
+      description: "Chain 1 or 4 decode tokens per GPU submit via indirect argmax -> embed",
+      values: [...VALID_CHAIN],
+      supportedValues: [...VALID_CHAIN],
+      urlParam: "chain",
+    },
   ];
 }
 
@@ -162,6 +175,9 @@ export function normalizeTuningConfig(
   if (!VALID_PACE.includes(merged.decodePacing)) {
     merged.decodePacing = "every_token";
   }
+  if (!VALID_CHAIN.includes(merged.gpuTokenChain)) {
+    merged.gpuTokenChain = 1;
+  }
   if (!VALID_FAULT_TARGET.includes(merged.faultTarget)) {
     merged.faultTarget = "attention";
   }
@@ -184,6 +200,7 @@ export function configKey(c: TuningConfig): string {
     `g${c.useSubgroups ? 1 : 0}`,
     `b:${c.dispatchBatching}`,
     `y:${c.decodePacing}`,
+    `c${c.gpuTokenChain}`,
     `f${c.faultEnabled ? c.faultTarget : 0}`,
   ].join("|");
 }
@@ -235,6 +252,12 @@ export function parseTuningUrl(search: string): ParsedUrlState {
   const paceRaw = params.get("pace") as DecodePacing | null;
   if (paceRaw && VALID_PACE.includes(paceRaw)) patch.decodePacing = paceRaw;
 
+  const chainRaw = params.get("chain");
+  if (chainRaw !== null) {
+    const n = Number(chainRaw);
+    if (n === 1 || n === 4) patch.gpuTokenChain = n;
+  }
+
   const fault = parseBoolParam(params.get("fault"));
   if (fault !== undefined) patch.faultEnabled = fault;
 
@@ -267,6 +290,7 @@ export function encodeConfigToUrl(
   url.searchParams.set("sg", config.useSubgroups ? "1" : "0");
   url.searchParams.set("batch", config.dispatchBatching);
   url.searchParams.set("pace", config.decodePacing);
+  url.searchParams.set("chain", String(config.gpuTokenChain));
   if (config.faultEnabled) {
     url.searchParams.set("fault", "1");
     url.searchParams.set("faultTarget", config.faultTarget);
@@ -276,6 +300,13 @@ export function encodeConfigToUrl(
     url.searchParams.set("prompt", trimmedPrompt);
   }
   return url.toString();
+}
+
+export function medianNumber(values: readonly number[]): number {
+  const finite = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  if (finite.length === 0) return 0;
+  const mid = Math.floor(finite.length / 2);
+  return finite.length % 2 === 1 ? finite[mid] : (finite[mid - 1] + finite[mid]) / 2;
 }
 
 export function scoreTuningRun(args: {
