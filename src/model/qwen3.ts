@@ -103,8 +103,17 @@ export class Qwen3WebGpuEngine {
   private readonly kCaches: GPUBuffer[];
   private readonly vCaches: GPUBuffer[];
 
-  // Reusable dynamic uniforms updated once per token step
+  // Reusable dynamic uniforms updated once per token step (or on fault change)
   private readonly uEmbed: GPUBuffer;
+  private readonly uNormHidden: GPUBuffer;
+  private readonly uNormQ: GPUBuffer;
+  private readonly uNormK: GPUBuffer;
+  private readonly uQmmQ: GPUBuffer;
+  private readonly uQmmKV: GPUBuffer;
+  private readonly uQmmO: GPUBuffer;
+  private readonly uQmmGateUp: GPUBuffer;
+  private readonly uQmmDown: GPUBuffer;
+  private readonly uQmmLmHead: GPUBuffer;
   private readonly uRopeQ: GPUBuffer;
   private readonly uRopeK: GPUBuffer;
   private readonly uRopeNormQ: GPUBuffer;
@@ -113,6 +122,7 @@ export class Qwen3WebGpuEngine {
   private readonly uSdpaOnline: GPUBuffer;
   private readonly uSdpaSplit: GPUBuffer;
   private readonly staticUniforms: GPUBuffer[];
+  private lastFaultKey = "off";
 
   // Static bind groups (zero per-token allocation!)
   private readonly bgEmbed: GPUBindGroup;
@@ -208,10 +218,16 @@ export class Qwen3WebGpuEngine {
     const uResAdd = createUniformBuffer(device, new Uint32Array([H, 0, 0, 0]));
     const uArgmax = createUniformBuffer(device, new Uint32Array([V, this.amaxBlocks, 0, 0]));
 
-    this.staticUniforms = [
-      uNormHidden, uNormQ, uNormK, uQmmQ, uQmmKV, uQmmO,
-      uQmmGateUp, uQmmDown, uQmmLmHead, uSwiglu, uResAdd, uArgmax,
-    ];
+    this.uNormHidden = uNormHidden;
+    this.uNormQ = uNormQ;
+    this.uNormK = uNormK;
+    this.uQmmQ = uQmmQ;
+    this.uQmmKV = uQmmKV;
+    this.uQmmO = uQmmO;
+    this.uQmmGateUp = uQmmGateUp;
+    this.uQmmDown = uQmmDown;
+    this.uQmmLmHead = uQmmLmHead;
+    this.staticUniforms = [uSwiglu, uResAdd, uArgmax];
 
     // Dynamic per-step uniforms
     this.uEmbed = createUniformBuffer(device, new Uint32Array([0, H, groupSize, 0]), "uEmbed");
@@ -498,18 +514,49 @@ export class Qwen3WebGpuEngine {
     });
   }
 
-  private writeStepUniforms(tokenId: number, pos: number, faultEnabled: boolean): number {
-    const { hiddenSize: H, numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, rmsNormEps: eps, ropeTheta, groupSize } = this.config;
+  private writeStepUniforms(tokenId: number, pos: number, fault: FaultConfig): number {
+    const { hiddenSize: H, numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, intermediateSize: I, vocabSize: V, rmsNormEps: eps, ropeTheta, groupSize } = this.config;
+    const qDim = Q * D;
+    const kvDim = KV * D;
     const kLen = pos + 1;
     const nblocks = Math.max(1, Math.ceil(kLen / SDPA_SPLIT_BK));
-    const faultU32 = faultEnabled ? 1 : 0;
+    const target = fault.target ?? "attention";
+    const attnFault = fault.enabled && target === "attention" ? 1 : 0;
+    const ropeFault = fault.enabled && target === "rope" ? 1 : 0;
+    const normFault = fault.enabled && target === "norm" ? 1 : 0;
+    const qmmFault = fault.enabled && target === "qmm" ? 1 : 0;
+
+    // Only rewrite norm/QMM uniforms when fault state actually changes (zero steady-state overhead)
+    const faultKey = fault.enabled ? target : "off";
+    if (faultKey !== this.lastFaultKey) {
+      this.lastFaultKey = faultKey;
+      const writeNorm = (buf: GPUBuffer, rows: number, rowLen: number, fVal: number) => {
+        const ab = new ArrayBuffer(32);
+        const u = new Uint32Array(ab); const f = new Float32Array(ab);
+        u[0] = rows; u[1] = rowLen; u[2] = 0; u[3] = fVal; f[4] = eps;
+        this.device.queue.writeBuffer(buf, 0, new Uint8Array(ab));
+      };
+      writeNorm(this.uNormHidden, 1, H, normFault);
+      writeNorm(this.uNormQ, Q, D, normFault);
+      writeNorm(this.uNormK, KV, D, normFault);
+
+      const writeQmm = (buf: GPUBuffer, n: number, k: number, fVal: number) => {
+        this.device.queue.writeBuffer(buf, 0, new Uint32Array([n, k, groupSize, fVal, 0, 0, 0, 0]));
+      };
+      writeQmm(this.uQmmQ, qDim, H, qmmFault);
+      writeQmm(this.uQmmKV, kvDim, H, qmmFault);
+      writeQmm(this.uQmmO, H, qDim, qmmFault);
+      writeQmm(this.uQmmGateUp, I, H, qmmFault);
+      writeQmm(this.uQmmDown, H, I, qmmFault);
+      writeQmm(this.uQmmLmHead, V, H, qmmFault);
+    }
 
     this.device.queue.writeBuffer(this.uEmbed, 0, new Uint32Array([tokenId, H, groupSize, 0]));
 
     const mkRope = (heads: number) => {
       const ab = new ArrayBuffer(32);
       const u = new Uint32Array(ab); const f = new Float32Array(ab);
-      u[0] = heads; u[1] = D; u[2] = pos; u[3] = 0; f[4] = ropeTheta; f[5] = 1.0;
+      u[0] = heads; u[1] = D; u[2] = pos; u[3] = ropeFault; f[4] = ropeTheta; f[5] = 1.0;
       return new Uint8Array(ab);
     };
     this.device.queue.writeBuffer(this.uRopeQ, 0, mkRope(Q));
@@ -518,7 +565,7 @@ export class Qwen3WebGpuEngine {
     const mkRopeNorm = (heads: number) => {
       const ab = new ArrayBuffer(32);
       const u = new Uint32Array(ab); const f = new Float32Array(ab);
-      u[0] = heads; u[1] = D; u[2] = pos; u[3] = 0; f[4] = eps; f[5] = ropeTheta; f[6] = 1.0; u[7] = 0;
+      u[0] = heads; u[1] = D; u[2] = pos; u[3] = 0; f[4] = eps; f[5] = ropeTheta; f[6] = 1.0; u[7] = ropeFault || normFault ? 1 : 0;
       return new Uint8Array(ab);
     };
     this.device.queue.writeBuffer(this.uRopeNormQ, 0, mkRopeNorm(Q));
@@ -529,7 +576,7 @@ export class Qwen3WebGpuEngine {
     const sdpaAb = new ArrayBuffer(32);
     const su = new Uint32Array(sdpaAb); const sf = new Float32Array(sdpaAb);
     su[0] = Q; su[1] = KV; su[2] = kLen; su[3] = MAX_SEQ;
-    sf[4] = 1 / Math.sqrt(D); su[5] = faultU32; su[6] = nblocks;
+    sf[4] = 1 / Math.sqrt(D); su[5] = attnFault; su[6] = nblocks;
     this.device.queue.writeBuffer(this.uSdpaOnline, 0, new Uint8Array(sdpaAb));
     this.device.queue.writeBuffer(this.uSdpaSplit, 0, new Uint8Array(sdpaAb));
 
@@ -551,7 +598,7 @@ export class Qwen3WebGpuEngine {
     const { hiddenSize: H, numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, intermediateSize: I, vocabSize: V, numHiddenLayers: L, groupSize } = this.config;
     const qDim = Q * D;
     const kvDim = KV * D;
-    const nblocks = this.writeStepUniforms(tokenId, pos, fault.enabled);
+    const nblocks = this.writeStepUniforms(tokenId, pos, fault);
     const kLen = pos + 1;
 
     const dispatches: DispatchEvent[] = [];
@@ -745,6 +792,7 @@ export class Qwen3WebGpuEngine {
         attentionDispatches: res.attentionDispatches,
         optFlags: opts,
         faultEnabled: fault.enabled,
+        faultTarget: fault.target ?? "attention",
         dispatches: res.dispatches,
         sampleSlice: res.sampleSlice,
       });
@@ -769,7 +817,9 @@ export class Qwen3WebGpuEngine {
       this.sdpaScratch, this.oOut, this.gateBuf, this.upBuf, this.mlpAct,
       this.downOut, this.logitsBuf, this.amaxVals, this.amaxIdxs,
       this.amaxOutIdx, this.amaxOutVal, this.readbackIdx, this.readbackSlice,
-      this.uEmbed, this.uRopeQ, this.uRopeK, this.uRopeNormQ, this.uRopeNormK,
+      this.uEmbed, this.uNormHidden, this.uNormQ, this.uNormK,
+      this.uQmmQ, this.uQmmKV, this.uQmmO, this.uQmmGateUp, this.uQmmDown, this.uQmmLmHead,
+      this.uRopeQ, this.uRopeK, this.uRopeNormQ, this.uRopeNormK,
       this.uKvWrite, this.uSdpaOnline, this.uSdpaSplit,
       ...this.staticUniforms,
       ...this.kCaches,

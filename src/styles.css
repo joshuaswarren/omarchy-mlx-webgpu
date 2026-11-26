@@ -909,6 +909,159 @@ button:disabled {
   white-space: nowrap;
 }
 
+.opt-head-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-race {
+  padding: 2px 8px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--amber);
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.btn-race:hover:not(:disabled) {
+  background: rgba(245, 158, 11, 0.22);
+  border-color: var(--amber);
+}
+
+.ab-race-card {
+  padding: 9px 12px;
+  background: var(--well);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 5px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ab-race-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.ab-race-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ab-race-gain {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: #2dd4bf;
+  background: rgba(20, 184, 166, 0.16);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.ab-race-match {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  background: rgba(148, 163, 184, 0.12);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.ab-race-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ab-race-row {
+  display: grid;
+  grid-template-columns: 155px minmax(0, 1fr) 128px;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.ab-race-label {
+  color: var(--ink-dim);
+  white-space: nowrap;
+}
+
+.ab-race-track {
+  height: 10px;
+  background: rgba(148, 163, 184, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.ab-race-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 260ms ease;
+}
+
+.ab-race-fill.is-base {
+  background: #3b82f6;
+}
+
+.ab-race-fill.is-opt {
+  background: var(--teal);
+}
+
+.ab-race-val {
+  text-align: right;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.fault-targets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.fault-target-btn {
+  padding: 4px 4px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--ink-dim);
+  background: var(--well);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.fault-target-btn:hover {
+  color: var(--ink);
+  border-color: rgba(239, 68, 68, 0.45);
+}
+
+.fault-target-btn.is-active {
+  color: #fecaca;
+  background: rgba(239, 68, 68, 0.2);
+  border-color: var(--fault);
+}
+
+.ins-pill.is-fault {
+  border-color: rgba(239, 68, 68, 0.7);
+  color: #fca5a5;
+}
+
 /* Single red Fault Switch */
 .fault-section {
   border-color: rgba(239, 68, 68, 0.48);

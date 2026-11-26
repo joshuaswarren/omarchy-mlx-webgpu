@@ -1,4 +1,4 @@
-import type { DispatchEvent, KernelId, OptFlags } from "../kernels/types";
+import type { DispatchEvent, FaultTarget, KernelId, OptFlags } from "../kernels/types";
 import {
   KERNEL_PROVENANCE,
   countDispatchesForOpts,
@@ -14,6 +14,7 @@ export interface KernelGraphState {
   dispatches: DispatchEvent[];
   optFlags: OptFlags;
   faultEnabled: boolean;
+  faultTarget?: FaultTarget;
   selectedLayer: number;
   selectedDispatchIndex: number | null;
 }
@@ -154,9 +155,23 @@ export function createKernelGraphView(
   const animDurationMs = 280;
   let rafId = 0;
 
-  function colorForKernel(kernel: KernelId, faultEnabled: boolean): string {
+  function isFaultedKernel(kernel: KernelId, faultEnabled: boolean, target: FaultTarget = "attention"): boolean {
+    if (!faultEnabled) return false;
+    if (target === "attention") {
+      return kernel === "sdpa_decode_online" || kernel === "sdpa_decode_split_p1" || kernel === "sdpa_decode_split_p2";
+    }
+    if (target === "qmm") {
+      return kernel === "qmm_vec" || kernel === "qmm_vec_swiglu";
+    }
+    if (target === "rope") {
+      return kernel === "fast_rope" || kernel === "fast_rope_norm";
+    }
+    return kernel === "fast_norm" || kernel === "fast_rope_norm";
+  }
+
+  function colorForKernel(kernel: KernelId, faultEnabled: boolean, target?: FaultTarget): string {
+    if (isFaultedKernel(kernel, faultEnabled, target ?? "attention")) return "#ef4444";
     const fam = KERNEL_PROVENANCE[kernel]?.family ?? "memory";
-    if (faultEnabled && fam === "attention") return "#ef4444";
     return FAMILY_COLORS[fam];
   }
 
@@ -278,7 +293,7 @@ export function createKernelGraphView(
         const d = col.items[i];
         const segH = Math.max(2, slotH * visualScale - segGap);
         const y = padT + plotH - (i + 1) * slotH * visualScale + segGap / 2;
-        ctx.fillStyle = colorForKernel(d.kernel, state.faultEnabled);
+        ctx.fillStyle = colorForKernel(d.kernel, state.faultEnabled, state.faultTarget);
         ctx.globalAlpha = isSelected || isHovered ? 1.0 : 0.88;
         ctx.fillRect(cx, y, barW, segH);
       }
@@ -369,7 +384,7 @@ export function createKernelGraphView(
       const w = Math.max(24, (weights[i] / sumW) * availW);
       const isSelected = state.selectedDispatchIndex === d.index;
       const isHovered = hoveredBarIndex === d.index;
-      const color = colorForKernel(d.kernel, state.faultEnabled);
+      const color = colorForKernel(d.kernel, state.faultEnabled, state.faultTarget);
 
       // Bar body
       ctx.fillStyle = color;

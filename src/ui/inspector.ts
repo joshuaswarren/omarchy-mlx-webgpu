@@ -1,4 +1,4 @@
-import type { DispatchEvent, KernelId, ParityResult } from "../kernels/types";
+import type { DispatchEvent, FaultTarget, KernelId, ParityResult } from "../kernels/types";
 import { KERNEL_PROVENANCE } from "../kernels/provenance";
 
 export interface InspectorHandlers {
@@ -9,8 +9,23 @@ export interface InspectorState {
   kernel: KernelId;
   dispatch: DispatchEvent | null;
   faultEnabled: boolean;
+  faultTarget?: FaultTarget;
   parityResults: ParityResult[];
   sampleSlice?: Float32Array;
+}
+
+function isInspectorFaultTarget(kernel: KernelId, faultEnabled: boolean, target: FaultTarget = "attention"): boolean {
+  if (!faultEnabled) return false;
+  if (target === "attention") {
+    return kernel === "sdpa_decode_online" || kernel === "sdpa_decode_split_p1" || kernel === "sdpa_decode_split_p2";
+  }
+  if (target === "qmm") {
+    return kernel === "qmm_vec" || kernel === "qmm_vec_swiglu";
+  }
+  if (target === "rope") {
+    return kernel === "fast_rope" || kernel === "fast_rope_norm";
+  }
+  return kernel === "fast_norm" || kernel === "fast_rope_norm";
 }
 
 export interface InspectorController {
@@ -232,11 +247,7 @@ export function createInspectorView(
     const totalWg = wg[0] * wg[1] * wg[2];
     ctx.fillText(`Workgroups: ${totalWg}`, gridPad, 8);
 
-    const isFaultTarget =
-      state.faultEnabled &&
-      (state.kernel === "sdpa_decode_online" ||
-        state.kernel === "sdpa_decode_split_p1" ||
-        state.kernel === "fast_norm");
+    const isFaultTarget = isInspectorFaultTarget(state.kernel, state.faultEnabled, state.faultTarget);
     const activeColor = isFaultTarget
       ? "#ef4444"
       : prov.family === "attention"
@@ -363,8 +374,9 @@ export function createInspectorView(
     const cellW = (width - padX * 2 - gap * (cols - 1)) / cols;
     const cellH = (height - padY * 2 - gap * (rows - 1)) / rows;
 
+    const isKernelFault = isInspectorFaultTarget(state.kernel, state.faultEnabled, state.faultTarget);
     const maxMag = Math.max(1e-7, ...values.map((v) => Math.abs(v)));
-    const isFaultScale = heatMode === "diff" && (maxMag > 1e-3 || state.faultEnabled);
+    const isFaultScale = heatMode === "diff" && (maxMag > 1e-3 || isKernelFault);
 
     for (let i = 0; i < Math.min(64, values.length); i++) {
       const r = Math.floor(i / cols);
@@ -418,8 +430,9 @@ export function createInspectorView(
     pickerBar.innerHTML = INSPECTABLE_KERNELS.map((id) => {
       const p = KERNEL_PROVENANCE[id];
       const active = id === state.kernel ? "is-active" : "";
+      const faulted = isInspectorFaultTarget(id, state.faultEnabled, state.faultTarget) ? "is-fault" : "";
       const badge = p.prNumber ? ` PR #${p.prNumber}` : "";
-      return `<button type="button" class="ins-pill ${active}" data-ins-kernel="${id}">${p.shortLabel}${badge}</button>`;
+      return `<button type="button" class="ins-pill ${active} ${faulted}" data-ins-kernel="${id}">${p.shortLabel}${badge}</button>`;
     }).join("");
 
     pickerBar.querySelectorAll<HTMLButtonElement>("[data-ins-kernel]").forEach((btn) => {
@@ -430,11 +443,12 @@ export function createInspectorView(
     });
 
     const prov = KERNEL_PROVENANCE[state.kernel];
+    const codeFaulted = isInspectorFaultTarget(state.kernel, state.faultEnabled, state.faultTarget);
     glslLinkEl.href = prov.omarchyUrl;
     glslLinkEl.textContent = prov.omarchyPath.split("/").slice(-2).join("/");
-    glslCodeEl.innerHTML = highlightShader(prov.glslSnippet, state.faultEnabled);
+    glslCodeEl.innerHTML = highlightShader(prov.glslSnippet, codeFaulted);
     wgslPathEl.textContent = prov.wgslPath;
-    wgslCodeEl.innerHTML = highlightShader(prov.wgslSnippet, state.faultEnabled);
+    wgslCodeEl.innerHTML = highlightShader(prov.wgslSnippet, codeFaulted);
     noteBar.textContent = `${prov.summary} ${prov.portNotes}`;
   }
 

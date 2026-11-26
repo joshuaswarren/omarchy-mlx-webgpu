@@ -34,10 +34,39 @@ export const DEFAULT_OPT_FLAGS: OptFlags = {
   fusedSwigluQmm: true,
 };
 
+/** Which real WGSL kernel family the fault switch corrupts (all TDR-safe). */
+export type FaultTarget = "attention" | "qmm" | "rope" | "norm";
+
 /** Single fault-injection switch: corrupts live kernel math safely (no TDR/OOB). */
 export interface FaultConfig {
-  /** When true, skips the online-softmax / split-K max-rescale & corrupts attention weights. */
+  /** When true, activates fault_mode=1 on the selected kernel target. */
   enabled: boolean;
+  /** Target kernel family to corrupt (defaults to "attention"). */
+  target?: FaultTarget;
+}
+
+/** Result of an automated back-to-back A/B decode race on the visitor's GPU. */
+export interface AbRaceResult {
+  prompt: string;
+  phase: "baseline" | "optimized" | "done";
+  tokenBudget: number;
+  baseline?: {
+    tokens: number[];
+    text: string;
+    avgTokPerSec: number;
+    msPerTok: number;
+    dispatchesPerTok: number;
+  };
+  optimized?: {
+    tokens: number[];
+    text: string;
+    avgTokPerSec: number;
+    msPerTok: number;
+    dispatchesPerTok: number;
+  };
+  speedupPct?: number;
+  exactMatchCount?: number;
+  comparedCount?: number;
 }
 
 /** One recorded GPU compute dispatch for Zoom Level 2 (Kernel Graph) & Level 3 (Dispatch Inspector). */
@@ -65,6 +94,7 @@ export interface TokenTrace {
   attentionDispatches: number;
   optFlags: OptFlags;
   faultEnabled: boolean;
+  faultTarget?: FaultTarget;
   dispatches: DispatchEvent[];
   /** Optional sample of attention weights / hidden activations for Level-3 heatmap. */
   sampleSlice?: Float32Array;
