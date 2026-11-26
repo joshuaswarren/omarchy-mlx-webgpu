@@ -375,7 +375,7 @@ async function boot() {
     if (options?.prompt !== undefined) {
       ui.setPrompt(options.prompt);
     }
-    const prompt = options?.prompt ?? ui.getPrompt();
+    const prompt = ui.getPrompt();
     const tokenBudget = options?.tokens ?? 24;
     if (options?.config) {
       applyTuningPatch(options.config, true);
@@ -426,7 +426,7 @@ async function boot() {
     if (options?.prompt !== undefined) {
       ui.setPrompt(options.prompt);
     }
-    const prompt = options?.prompt ?? ui.getPrompt();
+    const prompt = ui.getPrompt();
     const tokenBudget = options?.tokens ?? 24;
     const startMode = options?.start ?? "baseline";
     const startCfg =
