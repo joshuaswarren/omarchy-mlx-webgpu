@@ -6,9 +6,16 @@ export interface WebGpuContext {
   info: GpuAdapterInfo;
 }
 
+export class WebGpuUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WebGpuUnavailableError";
+  }
+}
+
 export async function initWebGpu(): Promise<WebGpuContext> {
   if (typeof navigator === "undefined" || !("gpu" in navigator) || !navigator.gpu) {
-    throw new Error(
+    throw new WebGpuUnavailableError(
       "WebGPU is not available in this browser. Open in Chrome/Edge 113+ or Safari 26+.",
     );
   }
@@ -18,7 +25,7 @@ export async function initWebGpu(): Promise<WebGpuContext> {
     adapter = await navigator.gpu.requestAdapter({ forceFallbackAdapter: true });
   }
   if (!adapter) {
-    throw new Error("No WebGPU adapter found on this device.");
+    throw new WebGpuUnavailableError("No WebGPU adapter found on this device.");
   }
 
   const requiredFeatures: GPUFeatureName[] = [];
