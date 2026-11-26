@@ -1,9 +1,15 @@
 import type { DispatchEvent, KernelId, OptFlags } from "./types";
 import { QWEN3_0_6B_4BIT } from "../model/config";
+import elemWgsl from "./wgsl/elem.wgsl?raw";
 import fastNormWgsl from "./wgsl/fast_norm.wgsl?raw";
+import fastRopeWgsl from "./wgsl/fast_rope.wgsl?raw";
+import fastRopeNormWgsl from "./wgsl/fast_rope_norm.wgsl?raw";
+import qmmVecWgsl from "./wgsl/qmm_vec.wgsl?raw";
+import qmmVecSwigluWgsl from "./wgsl/qmm_vec_swiglu.wgsl?raw";
 import sdpaOnlineWgsl from "./wgsl/sdpa_decode_online.wgsl?raw";
 import sdpaSplitP1Wgsl from "./wgsl/sdpa_decode_split_p1.wgsl?raw";
 import sdpaSplitP2Wgsl from "./wgsl/sdpa_decode_split_p2.wgsl?raw";
+import swigluWgsl from "./wgsl/swiglu.wgsl?raw";
 
 export type KernelFamily = "attention" | "qmm" | "norm_rope" | "swiglu" | "memory";
 
@@ -192,22 +198,7 @@ float c = cos(theta);
 float s = sin(theta);
 float y0 = x0 * c - x1 * s;
 float y1 = x0 * s + x1 * c;`,
-    wgslSnippet: `// Ported from omarchy-mlx fast_rope.comp
-@compute @workgroup_size(128, 1, 1)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let head = wg.x;
-  let pair = lid.x; // 0..63 for head_dim=128
-  if (pair >= 64u) { return; }
-  let inv_freq = exp(-f32(pair) * params.log_theta_over_half);
-  let angle = f32(params.position) * inv_freq;
-  let c = cos(angle);
-  let s = sin(angle);
-  let base = head * 128u;
-  let x0 = data[base + pair];
-  let x1 = data[base + pair + 64u];
-  out_data[base + pair] = x0 * c - x1 * s;
-  out_data[base + pair + 64u] = x0 * s + x1 * c;
-}`,
+    wgslSnippet: extractHotSection(fastRopeWgsl, "let c = cos(angle)", 6, 20),
   },
 
   fast_rope_norm: {
@@ -233,25 +224,7 @@ precise float weight = weight_load(params.aux_offset + thread);
 rounded[thread] = rope_round((weight * norm) * value);
 barrier();
 // Rotate (rounded[i], rounded[i + D/2]) by (cos(theta), sin(theta)) in-place`,
-    wgslSnippet: `// Ported from omarchy-mlx fast_rope_norm.comp
-@compute @workgroup_size(128, 1, 1)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let head = wg.x;
-  let t = lid.x;
-  let v = input_data[head * 128u + t];
-  s_sq[t] = v * v;
-  workgroupBarrier();
-  // 128-lane tree sum -> inv_rms
-  let inv_rms = inverseSqrt(s_sq[0] / 128.0 + params.eps);
-  s_norm[t] = v * inv_rms * weight_data[t];
-  workgroupBarrier();
-  if (t < 64u) {
-    let angle = f32(params.position) * exp(-f32(t) * params.log_theta_over_half);
-    let c = cos(angle); let s = sin(angle);
-    out_data[head * 128u + t] = s_norm[t] * c - s_norm[t + 64u] * s;
-    out_data[head * 128u + t + 64u] = s_norm[t] * s + s_norm[t + 64u] * c;
-  }
-}`,
+    wgslSnippet: extractHotSection(fastRopeNormWgsl, "let c = cos(angle)", 10, 22),
   },
 
   qmm_vec: {
@@ -277,20 +250,7 @@ float dot = fma(x3, float((packed >> 12u) & 0xfu),
             fma(x1, float((packed >> 4u)  & 0xfu),
                 x0 * float(packed & 0xfu))));
 acc += fma(scale, dot, input_sum * bias);`,
-    wgslSnippet: `// Ported from omarchy-mlx qmm_vec.comp (MLX 4-bit group_size=64)
-@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  // 8 groups of 32 lanes per workgroup; each group reduces one output row
-  let word = w_packed[row * words_per_row + w_idx];
-  let g = (w_idx * 8u) / 64u;
-  let scale = scales[row * groups_per_row + g];
-  let bias = biases[row * groups_per_row + g];
-  var acc = 0.0;
-  for (var n = 0u; n < 8u; n = n + 1u) {
-    let q = f32((word >> (n * 4u)) & 0xfu);
-    acc += x[w_idx * 8u + n] * (q * scale + bias);
-  }
-}`,
+    wgslSnippet: extractHotSection(qmmVecWgsl, "fn main", 0, 24),
   },
 
   qmm_vec_swiglu: {
@@ -313,17 +273,7 @@ Q4_QUAD_SWIGLU(wvg[r].x >> 16u, wvu[r].x >> 16u, xa.z, xa.w)
 acc_g[r] += fma(sg[r], dot_g[r], input_sum * bg[r]);
 acc_u[r] += fma(su[r], dot_u[r], input_sum * bu[r]);
 // Epilogue: out = silu(acc_g) * acc_u in registers (zero intermediate store)`,
-    wgslSnippet: `// Ported from omarchy-mlx qmm_vec.comp (QMM_VEC_SWIGLU)
-@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  // Stream input x once against gate_w and up_w simultaneously
-  let gate_val = reduce_group(acc_g);
-  let up_val = reduce_group(acc_u);
-  if (lane == 0u && row < params.n) {
-    let silu = gate_val / (1.0 + exp(-gate_val));
-    output[row] = silu * up_val;
-  }
-}`,
+    wgslSnippet: extractHotSection(qmmVecSwigluWgsl, "let silu =", 12, 20),
   },
 
   swiglu: {
@@ -346,14 +296,7 @@ vec4 up   = LOAD_VEC(up_buf.values[index]);
 vec4 sig  = round4(1.0 / (1.0 + exp(-gate)));
 vec4 silu = round4(gate * sig);
 output_data.values[index] = STORE_VEC(round4(silu * up));`,
-    wgslSnippet: `// Ported from omarchy-mlx swiglu.comp
-@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i >= params.count) { return; }
-  let g = gate_buf[i];
-  out_buf[i] = (g / (1.0 + exp(-g))) * up_buf[i];
-}`,
+    wgslSnippet: extractHotSection(swigluWgsl, "fn main", 0, 18),
   },
 
   embed_q4: {
@@ -363,7 +306,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     family: "memory",
     omarchyPath: "overlay/mlx/backend/omarchy/shaders/dequant.comp",
     omarchyUrl: `${REPO_BLOB}/overlay/mlx/backend/omarchy/shaders/dequant.comp`,
-    wgslPath: "src/kernels/wgsl/embed_q4.wgsl",
+    wgslPath: "src/kernels/wgsl/elem.wgsl",
     workgroupSize: [256, 1, 1],
     summary:
       "Dequantizes one 1024-wide row from the 4-bit affine token embedding table (151,936 vocab entries) on the GPU.",
@@ -372,16 +315,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 uint word = weights[token_id * words_per_row + (col >> 3u)];
 float q = float((word >> ((col & 7u) * 4u)) & 0xfu);
 output[col] = fma(q, scales[group_idx], biases[group_idx]);`,
-    wgslSnippet: `// Q4 affine single-row embedding dequantization
-@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let col = gid.x;
-  if (col >= params.hidden_size) { return; }
-  let word = embed_w[params.token_id * (params.hidden_size / 8u) + (col >> 3u)];
-  let q = f32((word >> ((col & 7u) * 4u)) & 0xfu);
-  let g = params.token_id * (params.hidden_size / 64u) + (col >> 6u);
-  hidden[col] = q * embed_scales[g] + embed_biases[g];
-}`,
+    wgslSnippet: extractHotSection(elemWgsl, "fn embed_q4", 1, 22),
   },
 
   residual_add: {
@@ -391,20 +325,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     family: "memory",
     omarchyPath: "overlay/mlx/backend/omarchy/shaders/binary_vec.comp",
     omarchyUrl: `${REPO_BLOB}/overlay/mlx/backend/omarchy/shaders/binary_vec.comp`,
-    wgslPath: "src/kernels/wgsl/residual_add.wgsl",
+    wgslPath: "src/kernels/wgsl/elem.wgsl",
     workgroupSize: [256, 1, 1],
     summary: "Accumulates attention or MLP projection output back onto the 1024-dim residual stream.",
     portNotes: "Runs twice per transformer layer (post-attention and post-MLP).",
     glslSnippet: `// overlay/mlx/backend/omarchy/shaders/binary_vec.comp
 uint idx = gl_GlobalInvocationID.x;
 out_data.values[idx] = lhs.values[idx] + rhs.values[idx];`,
-    wgslSnippet: `@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i < params.count) {
-    residual[i] = residual[i] + delta[i];
-  }
-}`,
+    wgslSnippet: extractHotSection(elemWgsl, "fn residual_add", 1, 18),
   },
 
   kv_cache_write: {
@@ -414,7 +342,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     family: "memory",
     omarchyPath: "overlay/mlx/backend/omarchy/shaders/slice_update_pair.comp",
     omarchyUrl: `${REPO_BLOB}/overlay/mlx/backend/omarchy/shaders/slice_update_pair.comp`,
-    wgslPath: "src/kernels/wgsl/kv_cache_write.wgsl",
+    wgslPath: "src/kernels/wgsl/elem.wgsl",
     workgroupSize: [128, 1, 1],
     summary: "Appends the newly rotated K and V vectors (8 KV heads x 128 dims) at slot `pos` in the layer KV cache.",
     portNotes: "Writes K and V in one dispatch so SDPA immediately sees the current token.",
@@ -422,33 +350,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 uint dst = kv_head * max_seq * D + pos * D + d;
 k_cache[dst] = k_new[kv_head * D + d];
 v_cache[dst] = v_new[kv_head * D + d];`,
-    wgslSnippet: `@compute @workgroup_size(128, 1, 1)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let kv_head = wg.x;
-  let d = lid.x;
-  let dst = kv_head * params.max_seq * 128u + params.pos * 128u + d;
-  k_cache[dst] = k_in[kv_head * 128u + d];
-  v_cache[dst] = v_in[kv_head * 128u + d];
-}`,
+    wgslSnippet: extractHotSection(elemWgsl, "fn kv_cache_write", 1, 22),
   },
 
   argmax: {
     id: "argmax",
-    title: "Greedy Logit Argmax",
+    title: "Greedy Logit Argmax (2-Pass)",
     shortLabel: "Argmax",
     family: "memory",
     omarchyPath: "overlay/mlx/backend/omarchy/shaders/argreduce_chunk.comp",
     omarchyUrl: `${REPO_BLOB}/overlay/mlx/backend/omarchy/shaders/argreduce_chunk.comp`,
-    wgslPath: "src/kernels/wgsl/argmax.wgsl",
+    wgslPath: "src/kernels/wgsl/elem.wgsl",
     workgroupSize: [256, 1, 1],
-    summary: "Selects the highest-scoring token ID over 151,936 vocabulary logits on the GPU.",
+    summary: "Two-pass block argmax (argmax P1 + argmax P2) over 151,936 vocabulary logits on the GPU.",
     portNotes: "Returns a single uint32 token ID back to the host per decode step.",
     glslSnippet: `// overlay/mlx/backend/omarchy/shaders/argreduce_chunk.comp
 // Shared-memory tree argmax over vocab logits (lowest index wins ties)`,
-    wgslSnippet: `@compute @workgroup_size(256, 1, 1)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
-  // Strided reduction across 151,936 logits -> single token_id
-}`,
+    wgslSnippet: extractHotSection(elemWgsl, "fn argmax_p1", 1, 22),
   },
 };
 
@@ -463,14 +381,15 @@ export interface DispatchSummary {
 
 export function countDispatchesForOpts(opts: OptFlags): DispatchSummary {
   const L = QWEN3_0_6B_4BIT.numHiddenLayers; // 28
+  const outerDispatches = 5; // embed_q4, final_norm, lm_head, argmax P1, argmax P2
   const baselinePerLayer = 19;
-  const baselineDispatches = 4 + L * baselinePerLayer; // 536
+  const baselineDispatches = outerDispatches + L * baselinePerLayer; // 537
   const perLayerDispatches =
     baselinePerLayer -
     (opts.oneDispatchAttention ? 1 : 0) -
     (opts.fusedRopeNorm ? 2 : 0) -
     (opts.fusedSwigluQmm ? 2 : 0);
-  const totalDispatches = 4 + L * perLayerDispatches;
+  const totalDispatches = outerDispatches + L * perLayerDispatches;
   return {
     totalDispatches,
     baselineDispatches,
@@ -603,10 +522,12 @@ export function buildSyntheticSchedule(opts: OptFlags, seqLen = 192): DispatchEv
     push(layer, "residual_add", "residual_add (mlp)", [Math.ceil(H / 256), 1, 1], [256, 1, 1], H * 8, H * 4, 8);
   }
 
-  // Output head
+  // Output head (4 dispatches: final_norm, lm_head, argmax P1, argmax P2)
+  const amaxBlocks = Math.ceil(V / 1024);
   push(-1, "fast_norm", "final_norm", [1, 1, 1], [256, 1, 1], H * 8, H * 4, 12);
-  push(-1, "qmm_vec", "lm_head (151,936 vocab Q4)", [Math.ceil(V / 8), 1, 1], [256, 1, 1], q4Bytes(V, H), V * 4, 420);
-  push(-1, "argmax", "greedy_argmax", [1, 1, 1], [256, 1, 1], V * 4, 4, 16);
+  push(-1, "qmm_vec", "lm_head (tied Q4)", [Math.ceil(V / 8), 1, 1], [256, 1, 1], q4Bytes(V, H) + H * 4, V * 4, 420);
+  push(-1, "argmax", "argmax P1", [amaxBlocks, 1, 1], [256, 1, 1], V * 4, amaxBlocks * 8, 12);
+  push(-1, "argmax", "argmax P2", [1, 1, 1], [256, 1, 1], amaxBlocks * 8, 8, 5);
 
   return dispatches;
 }

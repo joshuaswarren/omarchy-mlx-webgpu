@@ -269,6 +269,10 @@ kbd {
   color: var(--fault);
 }
 
+.metric-v.is-gain {
+  color: #2dd4bf;
+}
+
 .viewport {
   padding: 12px;
   min-height: 468px;
@@ -788,6 +792,7 @@ kbd {
 
 .action-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin-top: 8px;
 }
@@ -795,10 +800,10 @@ kbd {
 .btn-primary,
 .btn-secondary,
 .btn-ghost {
-  padding: 7px 12px;
+  padding: 7px 9px;
   border-radius: 4px;
   font-family: var(--sans);
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 600;
   cursor: pointer;
   border: 1px solid transparent;
@@ -808,6 +813,9 @@ kbd {
   flex: 1;
   background: var(--amber);
   color: #0b0e12;
+  font-size: 12px;
+  padding: 7px 9px;
+  white-space: nowrap;
 }
 
 .btn-primary:hover:not(:disabled) {
@@ -958,10 +966,37 @@ button:disabled {
 }
 
 /* Live CPU parity panel */
+.parity-head-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.parity-summary {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.parity-summary.is-pass {
+  background: rgba(20, 184, 166, 0.16);
+  color: #2dd4bf;
+}
+
+.parity-summary.is-fail {
+  background: rgba(239, 68, 68, 0.22);
+  color: #fca5a5;
+}
+
 .parity-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
+  max-height: 224px;
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 .parity-empty {

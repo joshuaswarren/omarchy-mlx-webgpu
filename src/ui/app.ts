@@ -84,6 +84,8 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   let optFlags: OptFlags = { ...DEFAULT_OPT_FLAGS };
   let fault: FaultConfig = { enabled: false };
   let generating = false;
+  let modelLoaded = false;
+  let modelLoading = false;
   let selectedLayer = 14;
   let selectedKernel: KernelId = "sdpa_decode_online";
   let selectedDispatch: DispatchEvent | null = null;
@@ -92,6 +94,12 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   let latestDispatches: DispatchEvent[] = buildSyntheticSchedule(optFlags, 192);
   let latestSampleSlice: Float32Array | undefined;
   let showPr997Table = false;
+
+  // Live A/B throughput tracker across unfused vs optimized non-fault tokens
+  let abBaseSamples: number[] = [];
+  let abBaseDispatches = 537;
+  let abOptSamples: number[] = [];
+  let abOptDispatches = 397;
 
   root.innerHTML = `
     <div class="shell" data-fault="false">
@@ -139,7 +147,11 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
               </div>
               <div class="metric-cell">
                 <span class="metric-k">Dispatches / tok</span>
-                <span class="metric-v tabular" data-readout-disp>396</span>
+                <span class="metric-v tabular" data-readout-disp>397</span>
+              </div>
+              <div class="metric-cell">
+                <span class="metric-k" data-readout-ab-label>Live A/B</span>
+                <span class="metric-v tabular" data-readout-ab>--</span>
               </div>
               <div class="metric-cell">
                 <span class="metric-k">Attention</span>
@@ -192,7 +204,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
               aria-label="Generation prompt"
             >${PROMPT_PRESETS[0].prompt}</textarea>
             <div class="action-row">
-              <button type="button" class="btn-primary" data-btn-generate>Generate</button>
+              <button type="button" class="btn-primary" data-btn-generate>Load &amp; Generate (320 MB, cached)</button>
               <button type="button" class="btn-secondary" data-btn-stop disabled>Stop</button>
               <button type="button" class="btn-ghost" data-btn-reset>Clear</button>
             </div>
@@ -257,7 +269,10 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
 
           <div class="bench-section parity-section">
             <div class="bench-head">
-              <h2 class="bench-title">Live CPU parity</h2>
+              <div class="parity-head-left">
+                <h2 class="bench-title">Live CPU parity</h2>
+                <span class="parity-summary tabular" data-parity-summary hidden></span>
+              </div>
               <button type="button" class="btn-mini" data-btn-parity>Re-run parity</button>
             </div>
             <div class="parity-list" data-parity-list>
@@ -344,7 +359,10 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
 
   const readoutTpsEl = root.querySelector<HTMLElement>("[data-readout-tps]")!;
   const readoutDispEl = root.querySelector<HTMLElement>("[data-readout-disp]")!;
+  const readoutAbLabelEl = root.querySelector<HTMLElement>("[data-readout-ab-label]")!;
+  const readoutAbEl = root.querySelector<HTMLElement>("[data-readout-ab]")!;
   const readoutAttnEl = root.querySelector<HTMLElement>("[data-readout-attn]")!;
+  const paritySummaryEl = root.querySelector<HTMLElement>("[data-parity-summary]")!;
 
   const statusPillEl = root.querySelector<HTMLElement>("[data-status-pill]")!;
   const tokenCountEl = root.querySelector<HTMLElement>("[data-token-count]")!;
@@ -389,6 +407,53 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     },
   });
 
+  function medianOf(values: number[]): number {
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  }
+
+  function syncGenerateButton() {
+    if (modelLoading) {
+      btnGenerate.textContent = "Loading model...";
+      btnGenerate.disabled = true;
+    } else if (generating) {
+      btnGenerate.textContent = modelLoaded ? "Generating..." : "Loading & generating...";
+      btnGenerate.disabled = true;
+    } else {
+      btnGenerate.textContent = modelLoaded ? "Generate" : "Load & Generate (320 MB, cached)";
+      btnGenerate.disabled = false;
+    }
+    btnStop.disabled = !generating;
+  }
+
+  function recordAbSample(trace: TokenTrace) {
+    if (trace.faultEnabled || !Number.isFinite(trace.tokPerSec) || trace.tokPerSec <= 0) return;
+    const allOpt =
+      trace.optFlags.oneDispatchAttention &&
+      trace.optFlags.fusedRopeNorm &&
+      trace.optFlags.fusedSwigluQmm;
+    const allBase =
+      !trace.optFlags.oneDispatchAttention &&
+      !trace.optFlags.fusedRopeNorm &&
+      !trace.optFlags.fusedSwigluQmm;
+    if (allOpt) {
+      abOptSamples.push(trace.tokPerSec);
+      if (abOptSamples.length > 24) abOptSamples.shift();
+      abOptDispatches = trace.totalDispatches;
+    } else {
+      // Prefer pure unfused baseline (537) when mixed with partial opt toggles
+      if (allBase && abBaseDispatches !== trace.totalDispatches) {
+        abBaseSamples = [];
+      }
+      if (allBase || abBaseDispatches !== 537 || abBaseSamples.length === 0) {
+        abBaseSamples.push(trace.tokPerSec);
+        if (abBaseSamples.length > 24) abBaseSamples.shift();
+        abBaseDispatches = trace.totalDispatches;
+      }
+    }
+  }
+
   function updateReadouts() {
     const counts = countDispatchesForOpts(optFlags);
     const lastToken = tokens[tokens.length - 1];
@@ -412,6 +477,30 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
       readoutTpsEl.textContent = `${lastToken.tokPerSec.toFixed(1)} tok/s`;
     } else {
       readoutTpsEl.textContent = "-- tok/s";
+    }
+
+    if (abBaseSamples.length > 0 && abOptSamples.length > 0) {
+      const baseMed = medianOf(abBaseSamples);
+      const optMed = medianOf(abOptSamples);
+      const pct = ((optMed - baseMed) / baseMed) * 100;
+      const sign = pct >= 0 ? "+" : "";
+      readoutAbLabelEl.textContent = `A/B (${abBaseDispatches} -> ${abOptDispatches})`;
+      readoutAbEl.textContent = `${baseMed.toFixed(1)} -> ${optMed.toFixed(1)} (${sign}${pct.toFixed(0)}%)`;
+      readoutAbEl.classList.toggle("is-gain", pct >= 0);
+    } else if (abOptSamples.length > 0) {
+      const optMed = medianOf(abOptSamples);
+      readoutAbLabelEl.textContent = "Live A/B";
+      readoutAbEl.textContent = `Opt ${optMed.toFixed(1)} | toggle for base`;
+      readoutAbEl.classList.remove("is-gain");
+    } else if (abBaseSamples.length > 0) {
+      const baseMed = medianOf(abBaseSamples);
+      readoutAbLabelEl.textContent = "Live A/B";
+      readoutAbEl.textContent = `Base ${baseMed.toFixed(1)} | enable opts`;
+      readoutAbEl.classList.remove("is-gain");
+    } else {
+      readoutAbLabelEl.textContent = "Live A/B";
+      readoutAbEl.textContent = "--";
+      readoutAbEl.classList.remove("is-gain");
     }
   }
 
@@ -469,12 +558,12 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     const plotH = height - padY * 2;
     const step = recent.length > 1 ? plotW / (recent.length - 1) : plotW;
 
-    // Background bars for dispatch count (396..536)
+    // Background bars for dispatch count (397..537)
     const barW = Math.max(3, Math.floor(plotW / Math.max(12, recent.length)) - 2);
     for (let i = 0; i < recent.length; i++) {
       const t = recent[i];
       const cx = padX + i * step;
-      const dh = Math.min(1, t.totalDispatches / 536) * plotH * 0.55;
+      const dh = Math.min(1, t.totalDispatches / 537) * plotH * 0.55;
       ctx.fillStyle = t.faultEnabled
         ? "rgba(239, 68, 68, 0.35)"
         : t.optFlags.oneDispatchAttention
@@ -535,17 +624,32 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
 
   function renderParity() {
     if (parityResults.length === 0) {
+      paritySummaryEl.hidden = true;
       parityListEl.innerHTML = `<div class="parity-empty">Waiting for WebGPU parity check</div>`;
       return;
     }
 
-    parityListEl.innerHTML = parityResults
-      .map((r, idx) => {
+    const failedCount = parityResults.filter((r) => !r.passed).length;
+    const passedCount = parityResults.length - failedCount;
+    paritySummaryEl.hidden = false;
+    paritySummaryEl.className = `parity-summary tabular ${failedCount > 0 ? "is-fail" : "is-pass"}`;
+    paritySummaryEl.textContent =
+      failedCount > 0
+        ? `${failedCount} FAULT${failedCount === 1 ? "" : "S"} CAUGHT`
+        : `${passedCount}/${parityResults.length} PASS`;
+
+    // Surface failed/faulted kernels at the top so Fault Switch impact is immediate
+    const ordered = parityResults
+      .map((r, origIdx) => ({ r, origIdx }))
+      .sort((a, b) => Number(a.r.passed) - Number(b.r.passed));
+
+    parityListEl.innerHTML = ordered
+      .map(({ r, origIdx }) => {
         const stateCls = r.passed ? "is-pass" : "is-fail";
         const badge = r.passed ? "PASS" : r.faultInjected ? "FAULT CAUGHT" : "FAIL";
         const maxBar = Math.max(1e-7, ...r.diffSample.map((v) => Math.abs(v)));
         const bars = r.diffSample
-          .slice(0, 24)
+          .slice(0, 20)
           .map((v) => {
             const pct = Math.max(8, Math.min(100, Math.round((Math.abs(v) / maxBar) * 100)));
             return `<i style="height:${pct}%"></i>`;
@@ -553,7 +657,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
           .join("");
 
         return `
-          <button type="button" class="parity-row ${stateCls}" data-parity-idx="${idx}">
+          <button type="button" class="parity-row ${stateCls}" data-parity-idx="${origIdx}">
             <div class="parity-row-top">
               <span class="parity-name">${escapeHtml(r.label)}</span>
               <span class="parity-badge ${stateCls}">${badge}</span>
@@ -642,7 +746,9 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     syncOptControls();
     callbacks.onFaultChange?.({ ...fault });
     syncSubViews();
-    void triggerParityRun(fault.enabled);
+    if (!callbacks.onFaultChange) {
+      void triggerParityRun(fault.enabled);
+    }
   }
 
   // Wire controls
@@ -754,11 +860,15 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     },
     setLoadProgress(progress: ModelLoadProgress) {
       if (progress.stage === "ready") {
+        modelLoaded = true;
+        modelLoading = false;
         loadbarEl.hidden = true;
         statusPillEl.textContent = progress.fromCache ? "Model ready (cached)" : "Model ready";
         statusPillEl.dataset.tone = "ok";
+        syncGenerateButton();
         return;
       }
+      modelLoading = true;
       loadbarEl.hidden = false;
       const pct =
         progress.totalBytes > 0
@@ -772,17 +882,24 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
       loadFillEl.style.width = `${pct}%`;
       statusPillEl.textContent = progress.message;
       statusPillEl.dataset.tone = "busy";
+      syncGenerateButton();
     },
     setGenerating(running: boolean) {
       generating = running;
-      btnGenerate.disabled = running;
-      btnStop.disabled = !running;
+      if (!running) modelLoading = false;
+      syncGenerateButton();
       statusPillEl.textContent = running ? "Generating on GPU" : tokens.length > 0 ? "Complete" : "Ready";
       statusPillEl.dataset.tone = running ? "busy" : tokens.length > 0 ? "ok" : "idle";
       renderTokens();
     },
     pushTokenTrace(trace: TokenTrace) {
+      if (!modelLoaded) {
+        modelLoaded = true;
+        modelLoading = false;
+        syncGenerateButton();
+      }
       tokens.push(trace);
+      recordAbSample(trace);
       if (trace.dispatches.length > 0) {
         latestDispatches = trace.dispatches;
       }

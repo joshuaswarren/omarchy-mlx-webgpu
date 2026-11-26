@@ -459,7 +459,7 @@ export function createKernelGraphView(
       eliminated.push("Fused SwiGLU QMM removed separate up_proj & swiglu (-2/layer, -56/tok)");
     }
     if (eliminated.length === 0) {
-      eliminatedStrip.innerHTML = `<span class="kg-elim-none">Baseline unfused graph active: all 19 dispatches per layer running (536/token).</span>`;
+      eliminatedStrip.innerHTML = `<span class="kg-elim-none">Baseline unfused graph active: all 19 dispatches per layer running (537/token).</span>`;
     } else {
       eliminatedStrip.innerHTML = eliminated
         .map((text) => `<span class="kg-elim-chip">${text}</span>`)
