@@ -70,10 +70,11 @@ export async function loadQwen3Weights(
     onProgress,
   );
 
+  const estimatedGpuBytes = 406 * 1024 * 1024;
   onProgress?.({
     stage: "upload",
     loadedBytes: 0,
-    totalBytes: config.numHiddenLayers + 2,
+    totalBytes: estimatedGpuBytes,
     message: "Parsing safetensors header & uploading embeddings to GPU…",
   });
 
@@ -149,9 +150,9 @@ export async function loadQwen3Weights(
     if ((l + 1) % 4 === 0 || l === config.numHiddenLayers - 1) {
       onProgress?.({
         stage: "upload",
-        loadedBytes: l + 2,
-        totalBytes: config.numHiddenLayers + 2,
-        message: `Uploaded layer ${l + 1}/${config.numHiddenLayers} (${(totalGpuBytes / 1048576).toFixed(0)} MB GPU buffers)`,
+        loadedBytes: totalGpuBytes,
+        totalBytes: Math.max(estimatedGpuBytes, totalGpuBytes),
+        message: `Uploaded layer ${l + 1}/${config.numHiddenLayers} to GPU`,
       });
       await new Promise((r) => setTimeout(r, 0));
     }
@@ -159,8 +160,8 @@ export async function loadQwen3Weights(
 
   onProgress?.({
     stage: "ready",
-    loadedBytes: config.numHiddenLayers + 2,
-    totalBytes: config.numHiddenLayers + 2,
+    loadedBytes: totalGpuBytes,
+    totalBytes: totalGpuBytes,
     message: `Ready — ${config.repoId} (${(totalGpuBytes / 1048576).toFixed(0)} MB on GPU)`,
   });
 
