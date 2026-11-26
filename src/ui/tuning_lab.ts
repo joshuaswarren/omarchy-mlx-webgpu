@@ -44,6 +44,41 @@ function escapeHtml(text: string): string {
     .replaceAll(">", "&gt;");
 }
 
+/**
+ * Produces a concise, honest one-line takeaway underneath the hill-climb trajectory
+ * so visitors never mistake a measured GPU trade-off (for example fewer dispatches
+ * scoring slower on a given adapter) for a bug.
+ */
+export function summarizeTrajectoryInsight(
+  history: TuningEvalResult[],
+  bestEval: TuningEvalResult | null,
+): string | null {
+  if (!bestEval || bestEval.score <= 0 || history.length < 2) return null;
+
+  const passing = history.filter((h) => h.parityPass && h.score > 0);
+  const fewerDispPassing = passing
+    .filter((h) => h.dispatchesPerTok < bestEval.dispatchesPerTok)
+    .sort((a, b) => a.dispatchesPerTok - b.dispatchesPerTok || b.score - a.score);
+
+  if (fewerDispPassing.length > 0) {
+    const fewest = fewerDispPassing[0];
+    return `On this GPU, fewer dispatches (${fewest.dispatchesPerTok}/tok at ${fewest.score.toFixed(1)} tok/s) was not faster than ${bestEval.dispatchesPerTok}/tok (${bestEval.score.toFixed(1)} tok/s) — kept the faster config.`;
+  }
+
+  const fasterFail = history
+    .filter((h) => !h.parityPass && h.tokPerSec > bestEval.score)
+    .sort((a, b) => b.tokPerSec - a.tokPerSec)[0];
+  if (fasterFail) {
+    return `On this GPU, ${fasterFail.label} (${fasterFail.tokPerSec.toFixed(1)} tok/s) changed output tokens and scored 0 — kept ${bestEval.score.toFixed(1)} tok/s (${bestEval.dispatchesPerTok} disp/tok).`;
+  }
+
+  if (bestEval.dispatchesPerTok < 537) {
+    return `On this GPU, cutting dispatches to ${bestEval.dispatchesPerTok}/tok was also fastest (${bestEval.score.toFixed(1)} tok/s, ${bestEval.parityMatched}/${bestEval.parityTotal} exact).`;
+  }
+
+  return null;
+}
+
 export function createTuningLabView(
   container: HTMLElement,
   handlers: TuningLabHandlers,
@@ -100,6 +135,7 @@ export function createTuningLabView(
           <span class="tl-panel-meta tabular" data-tl-step-meta>0 evals | parity fail scores 0</span>
         </div>
         <canvas class="tl-chart" data-tl-chart aria-label="Hill-climb score trajectory"></canvas>
+        <div class="tl-insight" data-tl-insight hidden></div>
         <div class="tl-table-wrap">
           <table class="tl-table">
             <thead>
@@ -144,6 +180,7 @@ export function createTuningLabView(
   const leversEl = container.querySelector<HTMLElement>("[data-tl-levers]")!;
   const stepMetaEl = container.querySelector<HTMLElement>("[data-tl-step-meta]")!;
   const chartCanvas = container.querySelector<HTMLCanvasElement>("[data-tl-chart]")!;
+  const insightEl = container.querySelector<HTMLElement>("[data-tl-insight]")!;
   const tbodyEl = container.querySelector<HTMLElement>("[data-tl-tbody]")!;
   const shareUrlEl = container.querySelector<HTMLElement>("[data-tl-share-url]")!;
   const copyBtn = container.querySelector<HTMLButtonElement>("[data-tl-copy]")!;
@@ -399,6 +436,9 @@ export function createTuningLabView(
 
     renderLevers(state);
     drawChart(state);
+    const insight = summarizeTrajectoryInsight(state.history, state.bestEval);
+    insightEl.hidden = !insight;
+    insightEl.textContent = insight ?? "";
     renderTable(state);
   }
 

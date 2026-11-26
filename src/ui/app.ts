@@ -22,6 +22,7 @@ import {
 } from "../kernels/provenance";
 import {
   DEFAULT_TUNING_CONFIG,
+  configKey,
   encodeConfigToUrl,
 } from "../tuning/config";
 import { createKernelGraphView } from "./zoom_canvas";
@@ -633,24 +634,32 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     readoutAttnEl.classList.toggle("is-fault", fault.enabled);
     optSavedEl.textContent = counts.savedDispatches > 0 ? `-${counts.savedDispatches}/tok` : "baseline";
 
-    // Smooth speed readout: use completed A/B leg avg or running average over current-config tokens
-    // so single-token jitter never contradicts the back-to-back A/B Race result.
+    // Smooth speed readout: use completed A/B leg avg, active Tuning Lab eval, or running average
+    // over clean current-config tokens so Tab 1 and Tab 4 never contradict each other.
     const matchingTokens = tokens.filter(
       (t) =>
+        !t.faultEnabled &&
         t.optFlags.oneDispatchAttention === optFlags.oneDispatchAttention &&
         t.optFlags.fusedRopeNorm === optFlags.fusedRopeNorm &&
         t.optFlags.fusedSwigluQmm === optFlags.fusedSwigluQmm &&
         t.tokenMs > 0,
     );
+    const activeTuningKey = configKey(tuningConfig);
+    const labBestMatchesActive =
+      tuningBestEval && tuningBestEval.score > 0 && tuningBestEval.configKey === activeTuningKey;
+    const allFusionsOn =
+      optFlags.oneDispatchAttention && optFlags.fusedRopeNorm && optFlags.fusedSwigluQmm;
     if (zoom === 4 && tuningLastEval && tuningLastEval.tokPerSec > 0) {
       readoutTpsEl.textContent = `${tuningLastEval.tokPerSec.toFixed(1)} tok/s`;
-    } else if (abRace?.phase === "done" && abRace.optimized && tokenMatchesOpts && optFlags.oneDispatchAttention) {
+    } else if (abRace?.phase === "done" && abRace.optimized && tokenMatchesOpts && allFusionsOn) {
       readoutTpsEl.textContent = `${abRace.optimized.avgTokPerSec.toFixed(1)} tok/s`;
     } else if (matchingTokens.length > 0) {
       const sample = matchingTokens.length > 3 ? matchingTokens.slice(1) : matchingTokens;
       const totalMs = sample.reduce((acc, t) => acc + t.tokenMs, 0);
       const avgTps = totalMs > 0 ? (sample.length * 1000) / totalMs : 0;
       readoutTpsEl.textContent = avgTps > 0 ? `${avgTps.toFixed(1)} tok/s` : "-- tok/s";
+    } else if (labBestMatchesActive && tuningBestEval) {
+      readoutTpsEl.textContent = `${tuningBestEval.tokPerSec.toFixed(1)} tok/s`;
     } else {
       readoutTpsEl.textContent = "-- tok/s";
     }
@@ -816,10 +825,16 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     }
 
     const last = recent[recent.length - 1];
-    const sample = recent.length > 3 ? recent.slice(1) : recent;
+    const countsNow = countDispatchesForOpts(optFlags);
+    const cleanRecent = recent.filter((t) => !t.faultEnabled && t.tokenMs > 0);
+    const sample = cleanRecent.length > 3 ? cleanRecent.slice(1) : cleanRecent.length > 0 ? cleanRecent : recent;
     const avgMs = sample.reduce((acc, t) => acc + t.tokenMs, 0) / sample.length;
     const avgTps = avgMs > 0 ? 1000 / avgMs : 0;
-    sparkCaptionEl.textContent = `step ${last.step} | avg ${avgTps.toFixed(1)} tok/s | ${last.totalDispatches} dispatches/tok`;
+    if (last.totalDispatches !== countsNow.totalDispatches) {
+      sparkCaptionEl.textContent = `previous stream (${last.totalDispatches} disp/tok) | active config: ${countsNow.totalDispatches} disp/tok — click Generate to stream`;
+    } else {
+      sparkCaptionEl.textContent = `step ${last.step} | avg ${avgTps.toFixed(1)} tok/s | ${last.totalDispatches} dispatches/tok`;
+    }
   }
 
   function renderTokens() {

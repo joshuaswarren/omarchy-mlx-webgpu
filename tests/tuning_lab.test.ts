@@ -18,6 +18,7 @@ import {
   scoreTuningRun,
 } from "../src/tuning/config";
 import { runCoordinateHillClimb } from "../src/tuning/hill_climb";
+import { summarizeTrajectoryInsight } from "../src/ui/tuning_lab";
 import { initWebGpu, WebGpuUnavailableError } from "../src/webgpu/device";
 
 const METAL_ADAPTER: GpuAdapterInfo = {
@@ -258,6 +259,43 @@ describe("Coordinate-ascent hill climber", () => {
     expect(report.best.config.fusedRopeNorm).toBe(true);
     expect(report.best.score).toBe(80);
     expect(report.steps.some((s) => s.label === "p2: rope=true" && s.status === "accepted")).toBe(true);
+  });
+
+  it("explains clearly when fewer dispatches was not faster on the visitor's GPU", () => {
+    const mkEval = (
+      step: number,
+      label: string,
+      dispatchesPerTok: number,
+      tokPerSec: number,
+      parityPass = true,
+    ) => ({
+      step,
+      label,
+      config: BASELINE_TUNING_CONFIG,
+      configKey: `k${step}`,
+      tokPerSec,
+      msPerTok: 1000 / tokPerSec,
+      dispatchesPerTok,
+      tokens: [1, 2],
+      text: "ok",
+      parityMatched: parityPass ? 2 : 1,
+      parityTotal: 2,
+      parityPass,
+      score: parityPass ? tokPerSec : 0,
+      status: parityPass ? ("accepted" as const) : ("parity_fail" as const),
+      shareUrl: "https://example.test/",
+      timestampMs: 0,
+    });
+
+    const best509 = mkEval(9, "wg=256", 509, 104.3, true);
+    const slower453 = mkEval(6, "rope=true", 453, 70.9, true);
+    const msg = summarizeTrajectoryInsight([slower453, best509], best509);
+    expect(msg).toContain("On this GPU, fewer dispatches (453/tok at 70.9 tok/s) was not faster than 509/tok (104.3 tok/s)");
+
+    const best397 = mkEval(5, "swiglu=true", 397, 130.0, true);
+    const base537 = mkEval(0, "Start baseline", 537, 80.0, true);
+    const msgFast = summarizeTrajectoryInsight([base537, best397], best397);
+    expect(msgFast).toContain("cutting dispatches to 397/tok was also fastest (130.0 tok/s");
   });
 
   it("throws WebGpuUnavailableError when navigator.gpu is missing", async () => {
