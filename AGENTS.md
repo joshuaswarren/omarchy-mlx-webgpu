@@ -30,6 +30,7 @@ Pass any subset of levers in the query string to load a specific configuration d
 | `sg` | `useSubgroups` | `1`, `0` | Hardware `subgroupAdd` reduction (requires adapter `subgroups` feature) |
 | `batch` | `dispatchBatching` | `single_pass`, `per_layer_pass`, `chunked_submit` | 1 compute pass vs 30 per-layer passes vs 4 queue submits per token |
 | `pace` | `decodePacing` | `every_token`, `every_4`, `unthrottled` | UI timer-yield and trace-readback cadence |
+| `chain` | `gpuTokenChain` | `1`, `4` | Chain 1 or 4 decode tokens in one GPU submit via indirect `argmax -> embed_q4_indirect` (cuts `mapAsync` syncs 4x) |
 | `fault` | `faultEnabled` | `0`, `1` | Inject a TDR-safe kernel fault (triggers parity fail -> score `0`) |
 | `faultTarget` | `faultTarget` | `attention`, `qmm`, `rope`, `norm` | Target kernel family when `fault=1` |
 | `autorun` | — | `1`, `0` | Automatically benchmark the URL config once boot parity passes |
@@ -61,8 +62,8 @@ Once `document.title` starts with `PARITY_PASS`, `window.omarchyLab` is ready:
 | `getState()` | `() => LabState` | `{ ready, adapter, model, config, levers, last, best, history, shareUrl }` |
 | `getLevers()` | `() => LeverSpec[]` | Every lever, all values, `supportedValues` on this GPU, and its `urlParam` |
 | `set(patch)` | `(patch: Partial<TuningConfig>) => TuningConfig` | Validates, normalizes, syncs UI & URL, returns active `TuningConfig` |
-| `run(opts?)` | `(opts?: { config?, prompt?, tokens?, label? }) => Promise<TuningEvalResult>` | Evaluates one config against reference tokens and returns scored JSON |
-| `hillClimb(opts?)` | `(opts?: { start?: "baseline" \| "current", prompt?, tokens?, maxPasses?: number }) => Promise<HillClimbReport>` | Runs multi-pass coordinate ascent (default `maxPasses: 2`, stops early on convergence) over all supported levers and returns full path JSON |
+| `run(opts?)` | `(opts?: { config?, prompt?, tokens?, label?, trials? }) => Promise<TuningEvalResult>` | Evaluates one config against reference tokens (adaptive median across `trials`, default `1`) and returns scored JSON |
+| `hillClimb(opts?)` | `(opts?: { start?: "baseline" \| "current", prompt?, tokens?, maxPasses?: number, trials?: number, minGainPct?: number }) => Promise<HillClimbReport>` | Runs multi-pass coordinate ascent (default `maxPasses: 2`, adaptive median-of-3 `trials`, `minGainPct: 1.0`) and returns full path JSON |
 | `read()` | `() => { adapter, config, last, best, history, shareUrl }` | Latest evaluation, best winning config, full history, and share link as plain JSON |
 | `shareUrl(cfg?, prompt?)` | `(cfg?: Partial<TuningConfig>, prompt?: string) => string` | Shareable URL for the best (or specified) config, preserving custom `prompt=` when set |
 | `stop()` | `() => void` | Cancels an in-flight benchmark or hill climb |

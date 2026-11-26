@@ -138,6 +138,7 @@ export type QmmWorkgroupSize = 64 | 128 | 256;
 export type QmmPrecision = "f32" | "f16" | "f16_accum";
 export type DispatchBatching = "single_pass" | "per_layer_pass" | "chunked_submit";
 export type DecodePacing = "every_token" | "every_4" | "unthrottled";
+export type GpuTokenChain = 1 | 4;
 
 /** Complete set of real GPU execution levers exposed in the Tuning Lab & Agent API. */
 export interface TuningConfig {
@@ -149,6 +150,7 @@ export interface TuningConfig {
   useSubgroups: boolean;
   dispatchBatching: DispatchBatching;
   decodePacing: DecodePacing;
+  gpuTokenChain: GpuTokenChain;
   faultEnabled: boolean;
   faultTarget: FaultTarget;
 }
@@ -180,6 +182,10 @@ export interface TuningEvalResult {
   status: "baseline" | "accepted" | "rejected" | "parity_fail" | "manual";
   shareUrl: string;
   timestampMs: number;
+  /** Number of replicate trials combined via median (1 on slow adapters, up to 3 on fast GPUs). */
+  trials?: number;
+  /** Individual trial throughputs (tok/s) when multiple trials were run. */
+  trialScores?: number[];
 }
 
 export interface HillClimbReport {

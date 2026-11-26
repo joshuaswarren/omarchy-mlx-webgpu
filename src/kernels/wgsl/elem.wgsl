@@ -23,6 +23,7 @@ struct EmbedParams {
 @group(0) @binding(2) var<storage, read> emb_biases: array<f32>;
 @group(0) @binding(3) var<storage, read_write> emb_dst: array<f32>;
 @group(0) @binding(4) var<uniform> emb_params: EmbedParams;
+@group(0) @binding(22) var<storage, read> emb_gpu_token: array<u32>;
 
 @compute @workgroup_size(256, 1, 1)
 fn embed_q4(
@@ -34,6 +35,32 @@ fn embed_q4(
   let groups_per_row = hidden_size / emb_params.group_size;
   let w_row = emb_params.token_id * words_per_row;
   let g_row = emb_params.token_id * groups_per_row;
+  let stride = num_wg.x * 256u;
+
+  for (var d = gid.x; d < hidden_size; d = d + stride) {
+    let word = emb_weights[w_row + (d >> 3u)];
+    let shift = (d & 7u) << 2u;
+    let q = (word >> shift) & 0xfu;
+    let g_idx = d / emb_params.group_size;
+    let scale = emb_scales[g_row + g_idx];
+    let bias = emb_biases[g_row + g_idx];
+    emb_dst[d] = f32(q) * scale + bias;
+  }
+}
+
+// On-GPU indirect embedding lookup: reads the previous step's winning token ID directly
+// from GPU memory so multiple autoregressive decode steps chain in one submission.
+@compute @workgroup_size(256, 1, 1)
+fn embed_q4_indirect(
+  @builtin(global_invocation_id) gid: vec3<u32>,
+  @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+  let token_id = emb_gpu_token[0];
+  let hidden_size = emb_params.hidden_size;
+  let words_per_row = hidden_size >> 3u;
+  let groups_per_row = hidden_size / emb_params.group_size;
+  let w_row = token_id * words_per_row;
+  let g_row = token_id * groups_per_row;
   let stride = num_wg.x * 256u;
 
   for (var d = gid.x; d < hidden_size; d = d + stride) {
