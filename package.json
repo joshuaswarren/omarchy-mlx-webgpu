@@ -8,9 +8,12 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test:cpu": "bun test tests/cpu_reference.test.ts",
-    "test:webgpu": "node tests/run_webgpu_parity.mjs"
+    "test:webgpu": "node tests/run_webgpu_parity.mjs",
+    "test:gpu": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@types/node": "^26.6.11",
     "@webgpu/types": "^0.1.60",
     "typescript": "^5.8.2",
     "vite": "^6.2.0"
