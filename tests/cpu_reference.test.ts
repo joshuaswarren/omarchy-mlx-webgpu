@@ -166,8 +166,11 @@ describe("WGSL portability guardrails", () => {
       expect(codeOnly).not.toMatch(/\benable\s+(subgroups|f16)\b/);
 
       let wgBytes = 0;
-      for (const m of codeOnly.matchAll(/var<workgroup>\s+\w+\s*:\s*array<(f32|u32|i32)\s*,\s*(\d+)>/g)) {
-        wgBytes += Number(m[2]) * 4;
+      for (const m of codeOnly.matchAll(
+        /var<workgroup>\s+\w+\s*:\s*array<(?:vec([234])<)?(f32|u32|i32)>?\s*,\s*(\d+)>/g,
+      )) {
+        const lanes = m[1] ? Number(m[1]) : 1;
+        wgBytes += lanes * 4 * Number(m[3]);
       }
       expect(wgBytes).toBeLessThanOrEqual(16384);
 
