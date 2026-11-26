@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test:cpu": "bun test tests/cpu_reference.test.ts",
+    "test:cpu": "bun test tests/cpu_reference.test.ts tests/tuning_lab.test.ts",
     "test:webgpu": "node tests/run_webgpu_parity.mjs",
     "test:gpu": "playwright test"
   },

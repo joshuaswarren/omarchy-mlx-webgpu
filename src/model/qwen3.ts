@@ -9,17 +9,43 @@ import sdpaSplitP1Wgsl from "../kernels/wgsl/sdpa_decode_split_p1.wgsl?raw";
 import sdpaSplitP2Wgsl from "../kernels/wgsl/sdpa_decode_split_p2.wgsl?raw";
 import swigluWgsl from "../kernels/wgsl/swiglu.wgsl?raw";
 import type {
+  DecodePacing,
+  DispatchBatching,
   DispatchEvent,
   FaultConfig,
   KernelId,
   OptFlags,
+  QmmPrecision,
+  QmmWorkgroupSize,
   TokenTrace,
 } from "../kernels/types";
+import {
+  buildQmmVecSwigluWgsl,
+  buildQmmVecWgsl,
+  buildSdpaOnlineWgsl,
+  qmmDispatchGridForWg,
+} from "../kernels/wgsl_variants";
 import { createCheckedShaderModule, createUniformBuffer } from "../webgpu/device";
-import { argmaxNumBlocks, qmmDispatchGrid } from "../webgpu/parity_kernels";
+import { argmaxNumBlocks } from "../webgpu/parity_kernels";
 import type { Qwen3Config } from "./config";
 import type { Qwen3Tokenizer } from "./tokenizer";
 import type { Q4LinearWeights, Qwen3GpuWeights } from "./weights";
+
+export interface ExecutionTuning {
+  qmmWorkgroupSize: QmmWorkgroupSize;
+  qmmPrecision: QmmPrecision;
+  useSubgroups: boolean;
+  dispatchBatching: DispatchBatching;
+  decodePacing: DecodePacing;
+}
+
+const DEFAULT_EXEC_TUNING: ExecutionTuning = {
+  qmmWorkgroupSize: 128,
+  qmmPrecision: "f32",
+  useSubgroups: false,
+  dispatchBatching: "single_pass",
+  decodePacing: "every_token",
+};
 
 const MAX_SEQ = 512;
 const SDPA_SPLIT_BK = 64;
@@ -73,6 +99,15 @@ export class Qwen3WebGpuEngine {
     argmaxP1: GPUComputePipeline;
     argmaxP2: GPUComputePipeline;
   };
+
+  // Explicit shared layouts so variant pipelines (wgSize / f16 / subgroups) reuse layerBgs with 0 realloc
+  private readonly bglQmmVec: GPUBindGroupLayout;
+  private readonly plQmmVec: GPUPipelineLayout;
+  private readonly bglQmmSwiglu: GPUBindGroupLayout;
+  private readonly plQmmSwiglu: GPUPipelineLayout;
+  private readonly bglSdpaOnline: GPUBindGroupLayout;
+  private readonly plSdpaOnline: GPUPipelineLayout;
+  private readonly variantCache = new Map<string, GPUComputePipeline>();
 
   // Pre-allocated activation scratch buffers & KV caches
   private readonly xA: GPUBuffer;
@@ -138,12 +173,29 @@ export class Qwen3WebGpuEngine {
     weights: Qwen3GpuWeights,
     tokenizer: Qwen3Tokenizer,
     pipelines: Qwen3WebGpuEngine["pipelines"],
+    layouts: {
+      bglQmmVec: GPUBindGroupLayout;
+      plQmmVec: GPUPipelineLayout;
+      bglQmmSwiglu: GPUBindGroupLayout;
+      plQmmSwiglu: GPUPipelineLayout;
+      bglSdpaOnline: GPUBindGroupLayout;
+      plSdpaOnline: GPUPipelineLayout;
+    },
   ) {
     this.device = device;
     this.weights = weights;
     this.config = weights.config;
     this.tokenizer = tokenizer;
     this.pipelines = pipelines;
+    this.bglQmmVec = layouts.bglQmmVec;
+    this.plQmmVec = layouts.plQmmVec;
+    this.bglQmmSwiglu = layouts.bglQmmSwiglu;
+    this.plQmmSwiglu = layouts.plQmmSwiglu;
+    this.bglSdpaOnline = layouts.bglSdpaOnline;
+    this.plSdpaOnline = layouts.plSdpaOnline;
+    this.variantCache.set("qmm:128:f32:0", pipelines.qmmVec);
+    this.variantCache.set("swiglu:128:f32:0", pipelines.qmmVecSwiglu);
+    this.variantCache.set("sdpa:0", pipelines.sdpaOnline);
 
     const { hiddenSize: H, numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, intermediateSize: I, vocabSize: V, numHiddenLayers: L, rmsNormEps: eps, ropeTheta, groupSize } = this.config;
     const qDim = Q * D;   // 2048
@@ -254,10 +306,10 @@ export class Qwen3WebGpuEngine {
     this.uSdpaOnline = createUniformBuffer(device, new Uint8Array(sdpaAb), "uSdpaOnline");
     this.uSdpaSplit = createUniformBuffer(device, new Uint8Array(sdpaAb), "uSdpaSplit");
 
-    // Helper for QMM bind group
+    // Helper for QMM bind group (uses explicit layout shared across wgSize/f16/subgroup variants)
     const bgQmm = (x: GPUBuffer, lin: Q4LinearWeights, dst: GPUBuffer, u: GPUBuffer) =>
       device.createBindGroup({
-        layout: pipelines.qmmVec.getBindGroupLayout(0),
+        layout: this.bglQmmVec,
         entries: [
           { binding: 0, resource: { buffer: x } },
           { binding: 1, resource: { buffer: lin.weight } },
@@ -388,7 +440,7 @@ export class Qwen3WebGpuEngine {
         ],
       }),
       sdpaOnline: device.createBindGroup({
-        layout: pipelines.sdpaOnline.getBindGroupLayout(0),
+        layout: this.bglSdpaOnline,
         entries: [
           { binding: 0, resource: { buffer: this.qRot } },
           { binding: 1, resource: { buffer: this.kCaches[l] } },
@@ -446,7 +498,7 @@ export class Qwen3WebGpuEngine {
         ],
       }),
       fusedSwiglu: device.createBindGroup({
-        layout: pipelines.qmmVecSwiglu.getBindGroupLayout(0),
+        layout: this.bglQmmSwiglu,
         entries: [
           { binding: 0, resource: { buffer: this.normBuf } },
           { binding: 1, resource: { buffer: lw.gateProj.weight } },
@@ -493,25 +545,119 @@ export class Qwen3WebGpuEngine {
       createCheckedShaderModule(device, "elem", elemWgsl),
     ]);
 
-    const mkPipe = (module: GPUShaderModule, entryPoint = "main") =>
-      device.createComputePipeline({ layout: "auto", compute: { module, entryPoint } });
-
-    return new Qwen3WebGpuEngine(device, weights, tokenizer, {
-      fastNorm: mkPipe(fastNormMod),
-      fastRope: mkPipe(fastRopeMod),
-      fastRopeNorm: mkPipe(fastRopeNormMod),
-      qmmVec: mkPipe(qmmVecMod),
-      qmmVecSwiglu: mkPipe(qmmVecSwigluMod),
-      swiglu: mkPipe(swigluMod),
-      sdpaOnline: mkPipe(sdpaOnlineMod),
-      sdpaSplitP1: mkPipe(sdpaSplitP1Mod),
-      sdpaSplitP2: mkPipe(sdpaSplitP2Mod),
-      embedQ4: mkPipe(elemMod, "embed_q4"),
-      residualAdd: mkPipe(elemMod, "residual_add"),
-      kvCacheWrite: mkPipe(elemMod, "kv_cache_write"),
-      argmaxP1: mkPipe(elemMod, "argmax_p1"),
-      argmaxP2: mkPipe(elemMod, "argmax_p2"),
+    const roBuf = (binding: number): GPUBindGroupLayoutEntry => ({
+      binding,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "read-only-storage" },
     });
+    const rwBuf = (binding: number): GPUBindGroupLayoutEntry => ({
+      binding,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "storage" },
+    });
+    const uBuf = (binding: number): GPUBindGroupLayoutEntry => ({
+      binding,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type: "uniform" },
+    });
+
+    const bglQmmVec = device.createBindGroupLayout({
+      label: "bgl_qmm_vec",
+      entries: [roBuf(0), roBuf(1), roBuf(2), roBuf(3), rwBuf(4), uBuf(5)],
+    });
+    const plQmmVec = device.createPipelineLayout({ label: "pl_qmm_vec", bindGroupLayouts: [bglQmmVec] });
+
+    const bglQmmSwiglu = device.createBindGroupLayout({
+      label: "bgl_qmm_swiglu",
+      entries: [roBuf(0), roBuf(1), roBuf(2), roBuf(3), roBuf(4), roBuf(5), roBuf(6), rwBuf(7), uBuf(8)],
+    });
+    const plQmmSwiglu = device.createPipelineLayout({ label: "pl_qmm_swiglu", bindGroupLayouts: [bglQmmSwiglu] });
+
+    const bglSdpaOnline = device.createBindGroupLayout({
+      label: "bgl_sdpa_online",
+      entries: [roBuf(0), roBuf(1), roBuf(2), rwBuf(3), uBuf(4)],
+    });
+    const plSdpaOnline = device.createPipelineLayout({ label: "pl_sdpa_online", bindGroupLayouts: [bglSdpaOnline] });
+
+    const mkPipe = (module: GPUShaderModule, entryPoint = "main", layout: GPUPipelineLayout | "auto" = "auto") =>
+      device.createComputePipeline({ layout, compute: { module, entryPoint } });
+
+    return new Qwen3WebGpuEngine(
+      device,
+      weights,
+      tokenizer,
+      {
+        fastNorm: mkPipe(fastNormMod),
+        fastRope: mkPipe(fastRopeMod),
+        fastRopeNorm: mkPipe(fastRopeNormMod),
+        qmmVec: mkPipe(qmmVecMod, "main", plQmmVec),
+        qmmVecSwiglu: mkPipe(qmmVecSwigluMod, "main", plQmmSwiglu),
+        swiglu: mkPipe(swigluMod),
+        sdpaOnline: mkPipe(sdpaOnlineMod, "main", plSdpaOnline),
+        sdpaSplitP1: mkPipe(sdpaSplitP1Mod),
+        sdpaSplitP2: mkPipe(sdpaSplitP2Mod),
+        embedQ4: mkPipe(elemMod, "embed_q4"),
+        residualAdd: mkPipe(elemMod, "residual_add"),
+        kvCacheWrite: mkPipe(elemMod, "kv_cache_write"),
+        argmaxP1: mkPipe(elemMod, "argmax_p1"),
+        argmaxP2: mkPipe(elemMod, "argmax_p2"),
+      },
+      { bglQmmVec, plQmmVec, bglQmmSwiglu, plQmmSwiglu, bglSdpaOnline, plSdpaOnline },
+    );
+  }
+
+  private async resolveVariantPipelines(exec: ExecutionTuning): Promise<{
+    qmmVec: GPUComputePipeline;
+    qmmVecSwiglu: GPUComputePipeline;
+    sdpaOnline: GPUComputePipeline;
+  }> {
+    const sgFlag = exec.useSubgroups ? 1 : 0;
+    const qmmKey = `qmm:${exec.qmmWorkgroupSize}:${exec.qmmPrecision}:${sgFlag}`;
+    const swKey = `swiglu:${exec.qmmWorkgroupSize}:${exec.qmmPrecision}:${sgFlag}`;
+    const sdpaKey = `sdpa:${sgFlag}`;
+
+    let qmmVec = this.variantCache.get(qmmKey);
+    if (!qmmVec) {
+      const code = buildQmmVecWgsl({
+        wgSize: exec.qmmWorkgroupSize,
+        precision: exec.qmmPrecision,
+        useSubgroups: exec.useSubgroups,
+      });
+      const mod = await createCheckedShaderModule(this.device, qmmKey, code);
+      qmmVec = this.device.createComputePipeline({
+        layout: this.plQmmVec,
+        compute: { module: mod, entryPoint: "main" },
+      });
+      this.variantCache.set(qmmKey, qmmVec);
+    }
+
+    let qmmVecSwiglu = this.variantCache.get(swKey);
+    if (!qmmVecSwiglu) {
+      const code = buildQmmVecSwigluWgsl({
+        wgSize: exec.qmmWorkgroupSize,
+        precision: exec.qmmPrecision,
+        useSubgroups: exec.useSubgroups,
+      });
+      const mod = await createCheckedShaderModule(this.device, swKey, code);
+      qmmVecSwiglu = this.device.createComputePipeline({
+        layout: this.plQmmSwiglu,
+        compute: { module: mod, entryPoint: "main" },
+      });
+      this.variantCache.set(swKey, qmmVecSwiglu);
+    }
+
+    let sdpaOnline = this.variantCache.get(sdpaKey);
+    if (!sdpaOnline) {
+      const code = buildSdpaOnlineWgsl(exec.useSubgroups);
+      const mod = await createCheckedShaderModule(this.device, sdpaKey, code);
+      sdpaOnline = this.device.createComputePipeline({
+        layout: this.plSdpaOnline,
+        compute: { module: mod, entryPoint: "main" },
+      });
+      this.variantCache.set(sdpaKey, sdpaOnline);
+    }
+
+    return { qmmVec, qmmVecSwiglu, sdpaOnline };
   }
 
   private writeStepUniforms(tokenId: number, pos: number, fault: FaultConfig): number {
@@ -584,8 +730,8 @@ export class Qwen3WebGpuEngine {
   }
 
   /**
-   * Executes one full 28-layer token step in a single WebGPU command submission.
-   * Returns the greedy next token id (if computeLogits=true) and exact dispatch trace.
+   * Executes one full 28-layer token step using the requested execution levers
+   * (variant QMM workgroup size / f16 / subgroups, pass/submit batching).
    */
   async forwardStep(
     tokenId: number,
@@ -594,20 +740,42 @@ export class Qwen3WebGpuEngine {
     fault: FaultConfig,
     computeLogits: boolean,
     recordTrace: boolean,
-  ): Promise<{ nextTokenId: number; dispatches: DispatchEvent[]; attentionDispatches: number; sampleSlice?: Float32Array }> {
+    exec: ExecutionTuning = DEFAULT_EXEC_TUNING,
+  ): Promise<{
+    nextTokenId: number;
+    dispatches: DispatchEvent[];
+    totalDispatches: number;
+    attentionDispatches: number;
+    sampleSlice?: Float32Array;
+  }> {
     const { hiddenSize: H, numAttentionHeads: Q, numKeyValueHeads: KV, headDim: D, intermediateSize: I, vocabSize: V, numHiddenLayers: L, groupSize } = this.config;
     const qDim = Q * D;
     const kvDim = KV * D;
     const nblocks = this.writeStepUniforms(tokenId, pos, fault);
     const kLen = pos + 1;
 
+    const variants = await this.resolveVariantPipelines(exec);
+    const wgQmm: [number, number, number] = [exec.qmmWorkgroupSize, 1, 1];
+
     const dispatches: DispatchEvent[] = [];
-    let dIdx = 0;
+    let totalDispatches = 0;
     let attentionDispatches = 0;
     const q4Bytes = (n: number, k: number) => Math.round(n * k * 0.5 + n * (k / groupSize) * 8);
 
-    const enc = this.device.createCommandEncoder({ label: `step_${pos}` });
-    const pass = enc.beginComputePass({ label: `qwen3_step_${pos}` });
+    let enc = this.device.createCommandEncoder({ label: `step_${pos}_0` });
+    let pass = enc.beginComputePass({ label: `qwen3_step_${pos}_0` });
+
+    const splitPass = (tag: string) => {
+      pass.end();
+      pass = enc.beginComputePass({ label: `qwen3_step_${pos}_${tag}` });
+    };
+
+    const splitSubmit = (tag: string) => {
+      pass.end();
+      this.device.queue.submit([enc.finish()]);
+      enc = this.device.createCommandEncoder({ label: `step_${pos}_${tag}` });
+      pass = enc.beginComputePass({ label: `qwen3_step_${pos}_${tag}` });
+    };
 
     const run = (
       layer: number,
@@ -623,9 +791,10 @@ export class Qwen3WebGpuEngine {
       pass.setPipeline(pipe);
       pass.setBindGroup(0, bg);
       pass.dispatchWorkgroups(wg[0], wg[1], wg[2]);
+      const idx = totalDispatches++;
       if (recordTrace) {
         dispatches.push({
-          index: dIdx++,
+          index: idx,
           layer,
           kernel,
           label,
@@ -637,23 +806,29 @@ export class Qwen3WebGpuEngine {
       }
     };
 
-    const gQ = qmmDispatchGrid(qDim);
-    const gKV = qmmDispatchGrid(kvDim);
-    const gH = qmmDispatchGrid(H);
-    const gI = qmmDispatchGrid(I);
-    const gV = qmmDispatchGrid(V);
+    const gQ = qmmDispatchGridForWg(qDim, exec.qmmWorkgroupSize);
+    const gKV = qmmDispatchGridForWg(kvDim, exec.qmmWorkgroupSize);
+    const gH = qmmDispatchGridForWg(H, exec.qmmWorkgroupSize);
+    const gI = qmmDispatchGridForWg(I, exec.qmmWorkgroupSize);
+    const gV = qmmDispatchGridForWg(V, exec.qmmWorkgroupSize);
 
     // Token embedding
     run(-1, "embed_q4", "embed_tokens (4-bit)", this.pipelines.embedQ4, this.bgEmbed, [Math.ceil(H / 256), 1, 1], [256, 1, 1], q4Bytes(1, H), H * 4);
 
     // 28 transformer layers
     for (let l = 0; l < L; l++) {
+      if (exec.dispatchBatching === "per_layer_pass") {
+        splitPass(`L${l}`);
+      } else if (exec.dispatchBatching === "chunked_submit" && l > 0 && l % 7 === 0) {
+        splitSubmit(`chunk_${l}`);
+      }
+
       const lb = this.layerBgs[l];
 
       run(l, "fast_norm", "input_layernorm", this.pipelines.fastNorm, lb.inNorm, [1, 1, 1], [256, 1, 1], H * 8, H * 4);
-      run(l, "qmm_vec", "q_proj (Q4)", this.pipelines.qmmVec, lb.qProj, gQ, [128, 1, 1], q4Bytes(qDim, H) + H * 4, qDim * 4);
-      run(l, "qmm_vec", "k_proj (Q4)", this.pipelines.qmmVec, lb.kProj, gKV, [128, 1, 1], q4Bytes(kvDim, H) + H * 4, kvDim * 4);
-      run(l, "qmm_vec", "v_proj (Q4)", this.pipelines.qmmVec, lb.vProj, gKV, [128, 1, 1], q4Bytes(kvDim, H) + H * 4, kvDim * 4);
+      run(l, "qmm_vec", "q_proj (Q4)", variants.qmmVec, lb.qProj, gQ, wgQmm, q4Bytes(qDim, H) + H * 4, qDim * 4);
+      run(l, "qmm_vec", "k_proj (Q4)", variants.qmmVec, lb.kProj, gKV, wgQmm, q4Bytes(kvDim, H) + H * 4, kvDim * 4);
+      run(l, "qmm_vec", "v_proj (Q4)", variants.qmmVec, lb.vProj, gKV, wgQmm, q4Bytes(kvDim, H) + H * 4, kvDim * 4);
 
       if (opts.fusedRopeNorm) {
         run(l, "fast_rope_norm", "q_norm + RoPE (fused)", this.pipelines.fastRopeNorm, lb.qRopeNorm, [Q, 1, 1], [128, 1, 1], qDim * 4 + D * 4, qDim * 4);
@@ -670,7 +845,7 @@ export class Qwen3WebGpuEngine {
       const kvReadBytes = KV * kLen * D * 4 * 2;
       if (opts.oneDispatchAttention) {
         attentionDispatches += 1;
-        run(l, "sdpa_decode_online", "SDPA online (PR #997)", this.pipelines.sdpaOnline, lb.sdpaOnline, [Q, 1, 1], [256, 1, 1], qDim * 4 + kvReadBytes, qDim * 4);
+        run(l, "sdpa_decode_online", "SDPA online (PR #997)", variants.sdpaOnline, lb.sdpaOnline, [Q, 1, 1], [256, 1, 1], qDim * 4 + kvReadBytes, qDim * 4);
       } else {
         attentionDispatches += 2;
         const scratchBytes = Q * nblocks * (D + 4) * 4;
@@ -678,26 +853,29 @@ export class Qwen3WebGpuEngine {
         run(l, "sdpa_decode_split_p2", "SDPA split-K P2", this.pipelines.sdpaSplitP2, lb.sdpaSplitP2, [Q, 1, 1], [128, 1, 1], scratchBytes, qDim * 4);
       }
 
-      run(l, "qmm_vec", "o_proj (Q4)", this.pipelines.qmmVec, lb.oProj, gH, [128, 1, 1], q4Bytes(H, qDim) + qDim * 4, H * 4);
+      run(l, "qmm_vec", "o_proj (Q4)", variants.qmmVec, lb.oProj, gH, wgQmm, q4Bytes(H, qDim) + qDim * 4, H * 4);
       run(l, "residual_add", "attn residual", this.pipelines.residualAdd, lb.res1, [Math.ceil(H / 256), 1, 1], [256, 1, 1], H * 8, H * 4);
 
       run(l, "fast_norm", "post_attn_layernorm", this.pipelines.fastNorm, lb.postNorm, [1, 1, 1], [256, 1, 1], H * 8, H * 4);
 
       if (opts.fusedSwigluQmm) {
-        run(l, "qmm_vec_swiglu", "gate+up+SwiGLU (fused)", this.pipelines.qmmVecSwiglu, lb.fusedSwiglu, gI, [128, 1, 1], q4Bytes(I, H) * 2 + H * 4, I * 4);
+        run(l, "qmm_vec_swiglu", "gate+up+SwiGLU (fused)", variants.qmmVecSwiglu, lb.fusedSwiglu, gI, wgQmm, q4Bytes(I, H) * 2 + H * 4, I * 4);
       } else {
-        run(l, "qmm_vec", "gate_proj (Q4)", this.pipelines.qmmVec, lb.gateProj, gI, [128, 1, 1], q4Bytes(I, H) + H * 4, I * 4);
-        run(l, "qmm_vec", "up_proj (Q4)", this.pipelines.qmmVec, lb.upProj, gI, [128, 1, 1], q4Bytes(I, H) + H * 4, I * 4);
+        run(l, "qmm_vec", "gate_proj (Q4)", variants.qmmVec, lb.gateProj, gI, wgQmm, q4Bytes(I, H) + H * 4, I * 4);
+        run(l, "qmm_vec", "up_proj (Q4)", variants.qmmVec, lb.upProj, gI, wgQmm, q4Bytes(I, H) + H * 4, I * 4);
         run(l, "swiglu", "swiglu", this.pipelines.swiglu, lb.swiglu, [Math.ceil(I / 256), 1, 1], [256, 1, 1], I * 8, I * 4);
       }
 
-      run(l, "qmm_vec", "down_proj (Q4)", this.pipelines.qmmVec, lb.downProj, gH, [128, 1, 1], q4Bytes(H, I) + I * 4, H * 4);
+      run(l, "qmm_vec", "down_proj (Q4)", variants.qmmVec, lb.downProj, gH, wgQmm, q4Bytes(H, I) + I * 4, H * 4);
       run(l, "residual_add", "mlp residual", this.pipelines.residualAdd, lb.res2, [Math.ceil(H / 256), 1, 1], [256, 1, 1], H * 8, H * 4);
     }
 
     if (computeLogits) {
+      if (exec.dispatchBatching === "per_layer_pass") {
+        splitPass("head");
+      }
       run(-1, "fast_norm", "final_norm", this.pipelines.fastNorm, this.bgFinalNorm, [1, 1, 1], [256, 1, 1], H * 8, H * 4);
-      run(-1, "qmm_vec", "lm_head (tied Q4)", this.pipelines.qmmVec, this.bgLmHead, gV, [128, 1, 1], q4Bytes(V, H) + H * 4, V * 4);
+      run(-1, "qmm_vec", "lm_head (tied Q4)", variants.qmmVec, this.bgLmHead, gV, wgQmm, q4Bytes(V, H) + H * 4, V * 4);
       run(-1, "argmax", "argmax P1", this.pipelines.argmaxP1, this.bgArgmaxP1, [this.amaxBlocks, 1, 1], [256, 1, 1], V * 4, this.amaxBlocks * 8);
       run(-1, "argmax", "argmax P2", this.pipelines.argmaxP2, this.bgArgmaxP2, [1, 1, 1], [256, 1, 1], this.amaxBlocks * 8, 8);
     }
@@ -706,7 +884,7 @@ export class Qwen3WebGpuEngine {
 
     if (!computeLogits) {
       this.device.queue.submit([enc.finish()]);
-      return { nextTokenId: -1, dispatches, attentionDispatches };
+      return { nextTokenId: -1, dispatches, totalDispatches, attentionDispatches };
     }
 
     enc.copyBufferToBuffer(this.amaxOutIdx, 0, this.readbackIdx, 0, 4);
@@ -726,12 +904,12 @@ export class Qwen3WebGpuEngine {
       this.readbackSlice.unmap();
     }
 
-    return { nextTokenId, dispatches, attentionDispatches, sampleSlice };
+    return { nextTokenId, dispatches, totalDispatches, attentionDispatches, sampleSlice };
   }
 
   /**
    * Streams greedy tokens from Qwen3-0.6B-4bit on the visitor's WebGPU device.
-   * Respects live mid-generation changes to OptFlags and FaultConfig on every token.
+   * Respects live mid-generation changes to OptFlags, FaultConfig, and ExecutionTuning.
    */
   async generate(
     userPrompt: string,
@@ -740,39 +918,52 @@ export class Qwen3WebGpuEngine {
     getFault: () => FaultConfig,
     onToken: (trace: TokenTrace) => void,
     shouldStop: () => boolean,
-  ): Promise<{ tokens: number[]; text: string; avgTokPerSec: number }> {
+    getExec?: () => ExecutionTuning,
+  ): Promise<{ tokens: number[]; text: string; avgTokPerSec: number; dispatchesPerTok: number }> {
     const formatted = this.tokenizer.formatChatPrompt(userPrompt);
     const promptIds = this.tokenizer.encode(formatted);
     if (promptIds.length >= MAX_SEQ - 8) {
       throw new Error(`Prompt too long (${promptIds.length} tokens; max ${MAX_SEQ - 8})`);
     }
 
-    // Prefill prompt tokens 0..N-2 without LM head readback (batched onto GPU queue)
+    const resolveExec = (): ExecutionTuning => (getExec ? { ...getExec() } : DEFAULT_EXEC_TUNING);
+
+    // Pre-compile variant pipelines before timing decode so compile latency doesn't distort tok/s
+    const initialExec = resolveExec();
+    await this.resolveVariantPipelines(initialExec);
+
+    // Prefill prompt tokens 0..N-2 without LM head readback
     const prefillOpts = getOpts();
     const prefillFault = getFault();
     for (let i = 0; i < promptIds.length - 1; i++) {
-      if (shouldStop()) return { tokens: [], text: "", avgTokPerSec: 0 };
-      await this.forwardStep(promptIds[i], i, prefillOpts, prefillFault, false, false);
+      if (shouldStop()) return { tokens: [], text: "", avgTokPerSec: 0, dispatchesPerTok: 0 };
+      await this.forwardStep(promptIds[i], i, prefillOpts, prefillFault, false, false, initialExec);
     }
     await this.device.queue.onSubmittedWorkDone();
 
-    // Decode first token from last prompt position
+    // Decode tokens from last prompt position
     const generated: number[] = [];
     let pos = promptIds.length - 1;
     let curToken = promptIds[pos];
     let decodedSoFar = "";
-    let totalDecodeMs = 0;
+    let lastDispatchesPerTok = 0;
     const eosSet = new Set(this.config.eosTokenIds);
     const budget = Math.min(maxNewTokens, MAX_SEQ - promptIds.length - 1);
+    const decodeWallStart = performance.now();
 
     for (let step = 0; step < budget; step++) {
       if (shouldStop()) break;
       const opts = { ...getOpts() };
       const fault = { ...getFault() };
+      const exec = resolveExec();
+      const wantTrace =
+        exec.decodePacing === "every_token" ||
+        (exec.decodePacing === "every_4" && (step === 0 || step % 4 === 3));
+
       const t0 = performance.now();
-      const res = await this.forwardStep(curToken, pos, opts, fault, true, true);
+      const res = await this.forwardStep(curToken, pos, opts, fault, true, wantTrace, exec);
       const tokenMs = Math.max(0.01, performance.now() - t0);
-      totalDecodeMs += tokenMs;
+      lastDispatchesPerTok = res.totalDispatches;
 
       const nextId = res.nextTokenId;
       if (eosSet.has(nextId)) break;
@@ -788,7 +979,7 @@ export class Qwen3WebGpuEngine {
         text: deltaText,
         tokenMs,
         tokPerSec: 1000 / tokenMs,
-        totalDispatches: res.dispatches.length,
+        totalDispatches: res.totalDispatches,
         attentionDispatches: res.attentionDispatches,
         optFlags: opts,
         faultEnabled: fault.enabled,
@@ -799,14 +990,19 @@ export class Qwen3WebGpuEngine {
 
       curToken = nextId;
       pos += 1;
-      // Yield 1 frame tick so browser paints live tokens & toggles stay instant
-      await new Promise((r) => setTimeout(r, 0));
+      if (exec.decodePacing === "every_token") {
+        await new Promise((r) => setTimeout(r, 0));
+      } else if (exec.decodePacing === "every_4" && step % 4 === 3) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
     }
 
+    const totalWallMs = Math.max(0.01, performance.now() - decodeWallStart);
     return {
       tokens: generated,
       text: decodedSoFar,
-      avgTokPerSec: generated.length > 0 && totalDecodeMs > 0 ? (generated.length * 1000) / totalDecodeMs : 0,
+      avgTokPerSec: generated.length > 0 ? (generated.length * 1000) / totalWallMs : 0,
+      dispatchesPerTok: lastDispatchesPerTok,
     };
   }
 

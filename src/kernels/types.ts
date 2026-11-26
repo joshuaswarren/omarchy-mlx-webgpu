@@ -130,6 +130,69 @@ export interface GpuAdapterInfo {
   maxComputeWorkgroupStorageSize: number;
   maxComputeInvocationsPerWorkgroup: number;
   hasTimestampQuery: boolean;
+  hasShaderF16: boolean;
+  hasSubgroups: boolean;
+}
+
+export type QmmWorkgroupSize = 64 | 128 | 256;
+export type QmmPrecision = "f32" | "f16" | "f16_accum";
+export type DispatchBatching = "single_pass" | "per_layer_pass" | "chunked_submit";
+export type DecodePacing = "every_token" | "every_4" | "unthrottled";
+
+/** Complete set of real GPU execution levers exposed in the Tuning Lab & Agent API. */
+export interface TuningConfig {
+  oneDispatchAttention: boolean;
+  fusedRopeNorm: boolean;
+  fusedSwigluQmm: boolean;
+  qmmWorkgroupSize: QmmWorkgroupSize;
+  qmmPrecision: QmmPrecision;
+  useSubgroups: boolean;
+  dispatchBatching: DispatchBatching;
+  decodePacing: DecodePacing;
+  faultEnabled: boolean;
+  faultTarget: FaultTarget;
+}
+
+export interface LeverSpec {
+  key: keyof TuningConfig;
+  label: string;
+  description: string;
+  values: Array<string | number | boolean>;
+  supportedValues: Array<string | number | boolean>;
+  urlParam: string;
+}
+
+export interface TuningEvalResult {
+  step: number;
+  label: string;
+  config: TuningConfig;
+  configKey: string;
+  tokPerSec: number;
+  msPerTok: number;
+  dispatchesPerTok: number;
+  tokens: number[];
+  text: string;
+  parityMatched: number;
+  parityTotal: number;
+  parityPass: boolean;
+  /** Live score: tokPerSec rounded to 2 decimals when parityPass is true, else 0. */
+  score: number;
+  status: "baseline" | "accepted" | "rejected" | "parity_fail" | "manual";
+  shareUrl: string;
+  timestampMs: number;
+}
+
+export interface HillClimbReport {
+  prompt: string;
+  tokenBudget: number;
+  adapter: GpuAdapterInfo | null;
+  referenceTokens: number[];
+  baseline: TuningEvalResult;
+  best: TuningEvalResult;
+  steps: TuningEvalResult[];
+  gainPct: number;
+  shareUrl: string;
+  stoppedEarly: boolean;
 }
 
 export interface ModelLoadProgress {

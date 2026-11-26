@@ -26,6 +26,14 @@ export async function initWebGpu(): Promise<WebGpuContext> {
   if (hasTimestampQuery) {
     requiredFeatures.push("timestamp-query");
   }
+  const hasShaderF16 = adapter.features.has("shader-f16");
+  if (hasShaderF16) {
+    requiredFeatures.push("shader-f16");
+  }
+  const hasSubgroups = adapter.features.has("subgroups" as GPUFeatureName);
+  if (hasSubgroups) {
+    requiredFeatures.push("subgroups" as GPUFeatureName);
+  }
 
   const device = await adapter.requestDevice({
     requiredFeatures,
@@ -49,6 +57,8 @@ export async function initWebGpu(): Promise<WebGpuContext> {
     maxComputeWorkgroupStorageSize: device.limits.maxComputeWorkgroupStorageSize,
     maxComputeInvocationsPerWorkgroup: device.limits.maxComputeInvocationsPerWorkgroup,
     hasTimestampQuery,
+    hasShaderF16,
+    hasSubgroups,
   };
 
   return { adapter, device, info };
