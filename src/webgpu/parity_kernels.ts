@@ -549,6 +549,7 @@ export async function verifyEmbedQ4Parity(
   hiddenSize = 1024,
   tokenId = 1337,
   groupSize = 64,
+  faultMode = false,
 ): Promise<ParityResult> {
   const { weightsU32, scalesF32, biasesF32 } = seededQ4Weights(
     vocabSize,
@@ -581,6 +582,7 @@ export async function verifyEmbedQ4Parity(
   u32[0] = tokenId;
   u32[1] = hiddenSize;
   u32[2] = groupSize;
+  u32[3] = faultMode ? 1 : 0;
   const uniformBuf = createUniformBuffer(device, new Uint8Array(paramBuf));
 
   const bg = device.createBindGroup({
@@ -623,7 +625,7 @@ export async function verifyEmbedQ4Parity(
     passed: metrics.maxAbsDiff <= tolerance,
     gpuMs,
     cpuMs,
-    faultInjected: false,
+    faultInjected: faultMode,
   };
 }
 
@@ -631,6 +633,7 @@ export async function verifyEmbedQ4Parity(
 export async function verifyResidualAddParity(
   device: GPUDevice,
   count = 1024,
+  faultMode = false,
 ): Promise<ParityResult> {
   const a = seededFloat32(count, 611, 2.0);
   const b = seededFloat32(count, 612, 2.0);
@@ -654,7 +657,9 @@ export async function verifyResidualAddParity(
   });
 
   const paramBuf = new ArrayBuffer(16);
-  new Uint32Array(paramBuf)[0] = count;
+  const u32 = new Uint32Array(paramBuf);
+  u32[0] = count;
+  u32[1] = faultMode ? 1 : 0;
   const uniformBuf = createUniformBuffer(device, new Uint8Array(paramBuf));
 
   const bg = device.createBindGroup({
@@ -695,7 +700,7 @@ export async function verifyResidualAddParity(
     passed: metrics.maxAbsDiff <= tolerance,
     gpuMs,
     cpuMs,
-    faultInjected: false,
+    faultInjected: faultMode,
   };
 }
 
@@ -709,6 +714,7 @@ export async function verifyKvCacheWriteParity(
   headDim = 128,
   maxSeq = 64,
   pos = 17,
+  faultMode = false,
 ): Promise<ParityResult> {
   const tokenElems = kvHeads * headDim;
   const cacheElems = kvHeads * maxSeq * headDim;
@@ -741,12 +747,13 @@ export async function verifyKvCacheWriteParity(
     GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
   );
 
-  const paramBuf = new ArrayBuffer(16);
+  const paramBuf = new ArrayBuffer(32);
   const u32 = new Uint32Array(paramBuf);
   u32[0] = kvHeads;
   u32[1] = headDim;
   u32[2] = maxSeq;
   u32[3] = pos;
+  u32[4] = faultMode ? 1 : 0;
   const uniformBuf = createUniformBuffer(device, new Uint8Array(paramBuf));
 
   const bg = device.createBindGroup({
@@ -798,7 +805,7 @@ export async function verifyKvCacheWriteParity(
     passed: metrics.maxAbsDiff <= tolerance,
     gpuMs,
     cpuMs,
-    faultInjected: false,
+    faultInjected: faultMode,
   };
 }
 
@@ -809,6 +816,7 @@ export async function verifyKvCacheWriteParity(
 export async function verifyArgmaxParity(
   device: GPUDevice,
   count = 151936,
+  faultMode = false,
 ): Promise<ParityResult> {
   const logits = seededFloat32(count, 631, 12.0);
   // Plant an exact tie at two distant indices to verify deterministic lowest-index tie-breaking.
@@ -857,6 +865,7 @@ export async function verifyArgmaxParity(
   const u32 = new Uint32Array(paramBuf);
   u32[0] = count;
   u32[1] = numBlocks;
+  u32[2] = faultMode ? 1 : 0;
   const uniformBuf = createUniformBuffer(device, new Uint8Array(paramBuf));
 
   const bg1 = device.createBindGroup({
@@ -926,7 +935,7 @@ export async function verifyArgmaxParity(
     passed: gpuIdx === cpuRes.index && valDiff <= 1e-6,
     gpuMs,
     cpuMs,
-    faultInjected: false,
+    faultInjected: faultMode,
   };
 }
 
@@ -952,9 +961,9 @@ export async function verifyAllKernelsParity(
   }
   results.push(await verifyQmmVecSwigluParity(device, 3072, 1024, 64, faultMode));
   results.push(await verifySwigluParity(device, 3072, faultMode));
-  results.push(await verifyEmbedQ4Parity(device, 4096, 1024, 1337, 64));
-  results.push(await verifyResidualAddParity(device, 1024));
-  results.push(await verifyKvCacheWriteParity(device, 8, 128, 64, 17));
-  results.push(await verifyArgmaxParity(device, 151936));
+  results.push(await verifyEmbedQ4Parity(device, 4096, 1024, 1337, 64, faultMode));
+  results.push(await verifyResidualAddParity(device, 1024, faultMode));
+  results.push(await verifyKvCacheWriteParity(device, 8, 128, 64, 17, faultMode));
+  results.push(await verifyArgmaxParity(device, 151936, faultMode));
   return results;
 }

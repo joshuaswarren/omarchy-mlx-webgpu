@@ -42,13 +42,19 @@ test.describe("GPU matrix: boot parity on the project adapter class", () => {
     }
 
     const failed = report!.results.filter((r) => !r.passed);
+    expect(report!.results.length, "all 12 unique engine kernels run at boot").toBe(12);
     expect(
       report!.allCleanPassed,
       `clean parity failed for: ${failed.map((r) => `${r.kernel} maxAbsDiff=${r.maxAbsDiff}`).join(", ")}`,
     ).toBe(true);
+    const uncaught = report!.faultResults.filter((r) => r.passed);
+    expect(
+      report!.faultResults.length,
+      "every boot parity kernel has a fault-injection proof",
+    ).toBe(report!.results.length);
     expect(
       report!.allFaultsDetected,
-      "fault-injected legs were not all detected as failing",
+      `fault-injected kernels not detected: ${uncaught.map((r) => r.kernel).join(", ")}`,
     ).toBe(true);
   });
 

@@ -50,7 +50,7 @@ Unsupported adapter capabilities (for example `prec=f16` on an adapter without `
 
 During boot, `document.title` resolves to one of four terminal prefixes:
 
-- `PARITY_PASS` — WebGPU initialized and all 10 boot kernels passed CPU parity (ready to run `window.omarchyLab`)
+- `PARITY_PASS` — WebGPU initialized and all 12 boot kernels passed CPU parity (with 12/12 fault-injection probes confirmed caught; ready to run `window.omarchyLab`)
 - `PARITY_FAIL` — WebGPU initialized, but a boot parity check failed
 - `PARITY_ERROR` — WebGPU initialized, but device setup or shader compilation threw an error
 - `WebGPU unavailable` — browser lacks WebGPU (`navigator.gpu` missing or no adapter); stop immediately instead of waiting for `PARITY_PASS`
