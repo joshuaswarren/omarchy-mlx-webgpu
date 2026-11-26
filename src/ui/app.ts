@@ -1,7 +1,9 @@
 import {
   DEFAULT_OPT_FLAGS,
+  type AbRaceResult,
   type DispatchEvent,
   type FaultConfig,
+  type FaultTarget,
   type GpuAdapterInfo,
   type KernelId,
   type ModelLoadProgress,
@@ -12,6 +14,7 @@ import {
 import { PR997_BENCHMARK, PUBLIC_APPLE_SILICON_HIGHLIGHTS } from "../data/public_benchmarks";
 import { QWEN3_0_6B_4BIT } from "../model/config";
 import {
+  KERNEL_PROVENANCE,
   buildSyntheticSchedule,
   countDispatchesForOpts,
 } from "../kernels/provenance";
@@ -22,11 +25,12 @@ export type ZoomLevel = 1 | 2 | 3;
 
 export interface AppCallbacks {
   onGenerate?: (prompt: string, opts: OptFlags, fault: FaultConfig) => void | Promise<void>;
+  onRunAbRace?: (prompt: string) => void | Promise<void>;
   onStop?: () => void;
   onReset?: () => void;
   onOptChange?: (opts: OptFlags) => void;
   onFaultChange?: (fault: FaultConfig) => void;
-  onRunParity?: (faultEnabled: boolean) => void | Promise<ParityResult[]>;
+  onRunParity?: (fault: FaultConfig | boolean) => void | Promise<ParityResult[]>;
   onZoomChange?: (level: ZoomLevel) => void;
 }
 
@@ -36,6 +40,7 @@ export interface AppController {
   setGenerating(running: boolean): void;
   pushTokenTrace(trace: TokenTrace): void;
   clearTokens(): void;
+  setAbRace(result: AbRaceResult | null): void;
   setParityResults(results: ParityResult[]): void;
   setOptFlags(opts: OptFlags): void;
   setFaultConfig(fault: FaultConfig): void;
@@ -53,18 +58,55 @@ export interface AppController {
   destroy(): void;
 }
 
+const FAULT_TARGETS: ReadonlyArray<{
+  id: FaultTarget;
+  label: string;
+  armedDesc: string;
+  activeDesc: string;
+  kernel: KernelId;
+}> = [
+  {
+    id: "attention",
+    label: "SDPA",
+    armedDesc: "Inverts online-softmax rescale mid-stream (TDR-safe)",
+    activeDesc: "SDPA rescale inverted (-1.0): watch attention & CPU parity fracture",
+    kernel: "sdpa_decode_online",
+  },
+  {
+    id: "qmm",
+    label: "Q4 QMM",
+    armedDesc: "Drops 4-bit affine bias in qmm_vec / qmm_vec_swiglu (TDR-safe)",
+    activeDesc: "Q4 QMM affine bias zeroed: weight dequantization & logits diverge",
+    kernel: "qmm_vec",
+  },
+  {
+    id: "rope",
+    label: "RoPE",
+    armedDesc: "Corrupts RoPE rotation & QK-norm RMS scale (TDR-safe)",
+    activeDesc: "RoPE / QK-norm scale dropped: positional geometry breaks mid-stream",
+    kernel: "fast_rope_norm",
+  },
+  {
+    id: "norm",
+    label: "RMSNorm",
+    armedDesc: "Drops RMSNorm denominator (inv_rms = 1.0, TDR-safe)",
+    activeDesc: "RMSNorm denominator dropped (1.0): hidden activations blow out",
+    kernel: "fast_norm",
+  },
+];
+
 const PROMPT_PRESETS = [
   {
-    label: "Online softmax",
-    prompt: "Explain in three crisp sentences why online softmax removes a GPU dispatch during LLM decoding.",
+    label: "Compute shader",
+    prompt: "In two short sentences, explain what a GPU compute shader does.",
   },
   {
-    label: "4-bit weights",
-    prompt: "Why does 4-bit group quantization speed up single-token LLM generation on a GPU?",
+    label: "Hash table",
+    prompt: "In two short sentences, explain how a hash table looks up a key in O(1) time.",
   },
   {
-    label: "GPU haiku",
-    prompt: "Write a short haiku about compute shaders running inside a web browser.",
+    label: "Primes",
+    prompt: "List the first five prime numbers and explain in one sentence why 2 is prime.",
   },
 ] as const;
 
@@ -82,7 +124,7 @@ function formatBytesMb(bytes: number): string {
 export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppController {
   let zoom: ZoomLevel = 1;
   let optFlags: OptFlags = { ...DEFAULT_OPT_FLAGS };
-  let fault: FaultConfig = { enabled: false };
+  let fault: FaultConfig = { enabled: false, target: "attention" };
   let generating = false;
   let adapterReady = false;
   let modelLoaded = false;
@@ -91,16 +133,11 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   let selectedKernel: KernelId = "sdpa_decode_online";
   let selectedDispatch: DispatchEvent | null = null;
   let tokens: TokenTrace[] = [];
+  let abRace: AbRaceResult | null = null;
   let parityResults: ParityResult[] = [];
   let latestDispatches: DispatchEvent[] = buildSyntheticSchedule(optFlags, 192);
   let latestSampleSlice: Float32Array | undefined;
   let showPr997Table = false;
-
-  // Live A/B throughput tracker across unfused vs optimized non-fault tokens
-  let abBaseSamples: number[] = [];
-  let abBaseDispatches = 537;
-  let abOptSamples: number[] = [];
-  let abOptDispatches = 397;
 
   root.innerHTML = `
     <div class="shell" data-fault="false">
@@ -169,10 +206,12 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
               </div>
               <div class="stream-output" data-token-stream aria-live="polite">
                 <div class="stream-empty">
-                  Enter a prompt on the right and click <b>Generate</b> to stream tokens directly from your GPU.
-                  Switch to <b>2 Kernel graph</b> or <b>3 Dispatch &amp; shader</b> anytime to inspect live dispatches.
+                  Click <b>Load &amp; Generate</b> to stream tokens on your GPU, or click <b>Race A/B</b> to benchmark
+                  537 unfused vs 397 optimized dispatches back-to-back. Switch to <b>2 Kernel graph</b> or
+                  <b>3 Dispatch &amp; shader</b> anytime to inspect live dispatches.
                 </div>
               </div>
+              <div class="ab-race-card" data-ab-race hidden></div>
               <div class="spark-panel">
                 <div class="spark-head">
                   <span>Live token throughput &amp; dispatch count</span>
@@ -214,7 +253,15 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
           <div class="bench-section">
             <div class="bench-head">
               <h2 class="bench-title">Optimizations</h2>
-              <span class="bench-badge tabular" data-opt-saved>-140/tok</span>
+              <div class="opt-head-right">
+                <button
+                  type="button"
+                  class="btn-race"
+                  data-btn-race
+                  title="Run 24 tokens unfused (537) vs optimized (397) back-to-back on your GPU"
+                >Race A/B</button>
+                <span class="bench-badge tabular" data-opt-saved>-140/tok</span>
+              </div>
             </div>
 
             <label class="opt-row opt-row-lead">
@@ -252,7 +299,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
             <div class="fault-row">
               <div class="fault-copy">
                 <span class="fault-title">Fault switch</span>
-                <span class="fault-desc" data-fault-desc>Corrupts online-softmax rescale mid-stream (TDR-safe)</span>
+                <span class="fault-desc" data-fault-desc>Inverts online-softmax rescale mid-stream (TDR-safe)</span>
               </div>
               <button
                 type="button"
@@ -265,6 +312,12 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
                 <span class="fault-thumb"></span>
                 <span class="fault-label" data-fault-label>OFF</span>
               </button>
+            </div>
+            <div class="fault-targets" role="group" aria-label="Target kernel to fault">
+              ${FAULT_TARGETS.map(
+                (t) =>
+                  `<button type="button" class="fault-target-btn${t.id === "attention" ? " is-active" : ""}" data-fault-target="${t.id}">${t.label}</button>`,
+              ).join("")}
             </div>
           </div>
 
@@ -368,6 +421,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   const statusPillEl = root.querySelector<HTMLElement>("[data-status-pill]")!;
   const tokenCountEl = root.querySelector<HTMLElement>("[data-token-count]")!;
   const tokenStreamEl = root.querySelector<HTMLElement>("[data-token-stream]")!;
+  const abRaceCardEl = root.querySelector<HTMLElement>("[data-ab-race]")!;
   const sparkCanvas = root.querySelector<HTMLCanvasElement>("[data-spark-canvas]")!;
   const sparkCaptionEl = root.querySelector<HTMLElement>("[data-spark-caption]")!;
 
@@ -375,11 +429,13 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   const btnGenerate = root.querySelector<HTMLButtonElement>("[data-btn-generate]")!;
   const btnStop = root.querySelector<HTMLButtonElement>("[data-btn-stop]")!;
   const btnReset = root.querySelector<HTMLButtonElement>("[data-btn-reset]")!;
+  const btnRace = root.querySelector<HTMLButtonElement>("[data-btn-race]")!;
   const optSavedEl = root.querySelector<HTMLElement>("[data-opt-saved]")!;
   const optInputs = Array.from(root.querySelectorAll<HTMLInputElement>("[data-opt]"));
   const faultSwitchBtn = root.querySelector<HTMLButtonElement>("[data-fault-switch]")!;
   const faultLabelEl = root.querySelector<HTMLElement>("[data-fault-label]")!;
   const faultDescEl = root.querySelector<HTMLElement>("[data-fault-desc]")!;
+  const faultTargetBtns = Array.from(root.querySelectorAll<HTMLButtonElement>("[data-fault-target]"));
   const btnParity = root.querySelector<HTMLButtonElement>("[data-btn-parity]")!;
   const parityListEl = root.querySelector<HTMLElement>("[data-parity-list]")!;
   const btnPr997 = root.querySelector<HTMLButtonElement>("[data-btn-pr997]")!;
@@ -408,51 +464,79 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     },
   });
 
-  function medianOf(values: number[]): number {
-    const sorted = [...values].sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
-  }
-
   function syncGenerateButton() {
     if (modelLoading) {
       btnGenerate.textContent = "Loading model...";
       btnGenerate.disabled = true;
+      btnRace.disabled = true;
     } else if (generating) {
       btnGenerate.textContent = modelLoaded ? "Generating..." : "Loading & generating...";
       btnGenerate.disabled = true;
+      btnRace.disabled = true;
     } else {
       btnGenerate.textContent = modelLoaded ? "Generate" : "Load & Generate (320 MB, cached)";
       btnGenerate.disabled = false;
+      btnRace.disabled = false;
     }
     btnStop.disabled = !generating;
   }
 
-  function recordAbSample(trace: TokenTrace) {
-    if (trace.faultEnabled || !Number.isFinite(trace.tokPerSec) || trace.tokPerSec <= 0) return;
-    const allOpt =
-      trace.optFlags.oneDispatchAttention &&
-      trace.optFlags.fusedRopeNorm &&
-      trace.optFlags.fusedSwigluQmm;
-    const allBase =
-      !trace.optFlags.oneDispatchAttention &&
-      !trace.optFlags.fusedRopeNorm &&
-      !trace.optFlags.fusedSwigluQmm;
-    if (allOpt) {
-      abOptSamples.push(trace.tokPerSec);
-      if (abOptSamples.length > 24) abOptSamples.shift();
-      abOptDispatches = trace.totalDispatches;
-    } else {
-      // Prefer pure unfused baseline (537) when mixed with partial opt toggles
-      if (allBase && abBaseDispatches !== trace.totalDispatches) {
-        abBaseSamples = [];
-      }
-      if (allBase || abBaseDispatches !== 537 || abBaseSamples.length === 0) {
-        abBaseSamples.push(trace.tokPerSec);
-        if (abBaseSamples.length > 24) abBaseSamples.shift();
-        abBaseDispatches = trace.totalDispatches;
-      }
+  function renderAbRace() {
+    if (!abRace) {
+      abRaceCardEl.hidden = true;
+      abRaceCardEl.innerHTML = "";
+      return;
     }
+    abRaceCardEl.hidden = false;
+    const baseTps = abRace.baseline?.avgTokPerSec ?? 0;
+    const optTps = abRace.optimized?.avgTokPerSec ?? 0;
+    const maxTps = Math.max(1, baseTps, optTps);
+    const basePct = baseTps > 0 ? Math.max(8, Math.round((baseTps / maxTps) * 100)) : 0;
+    const optPct = optTps > 0 ? Math.max(8, Math.round((optTps / maxTps) * 100)) : 0;
+
+    const title =
+      abRace.phase === "baseline"
+        ? `Live A/B Race (1/2: baseline ${abRace.tokenBudget} tokens...)`
+        : abRace.phase === "optimized"
+          ? `Live A/B Race (2/2: PR #997 + fusions ${abRace.tokenBudget} tokens...)`
+          : "Live A/B Race on your GPU";
+
+    const gainBadge =
+      abRace.phase === "done" && abRace.speedupPct !== undefined
+        ? `<span class="ab-race-gain tabular">${abRace.speedupPct >= 0 ? "+" : ""}${abRace.speedupPct.toFixed(1)}% faster</span>`
+        : "";
+    const matchBadge =
+      abRace.phase === "done" && abRace.comparedCount
+        ? `<span class="ab-race-match tabular">${abRace.exactMatchCount}/${abRace.comparedCount} exact tokens</span>`
+        : "";
+
+    const baseVal = abRace.baseline
+      ? `${abRace.baseline.avgTokPerSec.toFixed(1)} tok/s (${abRace.baseline.msPerTok.toFixed(1)} ms)`
+      : "running...";
+    const optVal = abRace.optimized
+      ? `${abRace.optimized.avgTokPerSec.toFixed(1)} tok/s (${abRace.optimized.msPerTok.toFixed(1)} ms)`
+      : abRace.phase === "optimized"
+        ? "running..."
+        : "queued";
+
+    abRaceCardEl.innerHTML = `
+      <div class="ab-race-head">
+        <span>${title}</span>
+        <div class="ab-race-badges">${gainBadge}${matchBadge}</div>
+      </div>
+      <div class="ab-race-rows">
+        <div class="ab-race-row">
+          <span class="ab-race-label">Baseline (${abRace.baseline?.dispatchesPerTok ?? 537} disp/tok)</span>
+          <div class="ab-race-track"><div class="ab-race-fill is-base" style="width:${basePct}%"></div></div>
+          <span class="ab-race-val tabular">${baseVal}</span>
+        </div>
+        <div class="ab-race-row">
+          <span class="ab-race-label">Optimized (${abRace.optimized?.dispatchesPerTok ?? 397} disp/tok)</span>
+          <div class="ab-race-track"><div class="ab-race-fill is-opt" style="width:${optPct}%"></div></div>
+          <span class="ab-race-val tabular">${optVal}</span>
+        </div>
+      </div>
+    `;
   }
 
   function updateReadouts() {
@@ -474,33 +558,39 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     readoutAttnEl.classList.toggle("is-fault", fault.enabled);
     optSavedEl.textContent = counts.savedDispatches > 0 ? `-${counts.savedDispatches}/tok` : "baseline";
 
-    if (lastToken && Number.isFinite(lastToken.tokPerSec) && lastToken.tokPerSec > 0) {
-      readoutTpsEl.textContent = `${lastToken.tokPerSec.toFixed(1)} tok/s`;
+    // Smooth speed readout: use completed A/B leg avg or running average over current-config tokens
+    // so single-token jitter never contradicts the back-to-back A/B Race result.
+    const matchingTokens = tokens.filter(
+      (t) =>
+        t.optFlags.oneDispatchAttention === optFlags.oneDispatchAttention &&
+        t.optFlags.fusedRopeNorm === optFlags.fusedRopeNorm &&
+        t.optFlags.fusedSwigluQmm === optFlags.fusedSwigluQmm &&
+        t.tokenMs > 0,
+    );
+    if (abRace?.phase === "done" && abRace.optimized && tokenMatchesOpts && optFlags.oneDispatchAttention) {
+      readoutTpsEl.textContent = `${abRace.optimized.avgTokPerSec.toFixed(1)} tok/s`;
+    } else if (matchingTokens.length > 0) {
+      const sample = matchingTokens.length > 3 ? matchingTokens.slice(1) : matchingTokens;
+      const totalMs = sample.reduce((acc, t) => acc + t.tokenMs, 0);
+      const avgTps = totalMs > 0 ? (sample.length * 1000) / totalMs : 0;
+      readoutTpsEl.textContent = avgTps > 0 ? `${avgTps.toFixed(1)} tok/s` : "-- tok/s";
     } else {
       readoutTpsEl.textContent = "-- tok/s";
     }
 
-    if (abBaseSamples.length > 0 && abOptSamples.length > 0) {
-      const baseMed = medianOf(abBaseSamples);
-      const optMed = medianOf(abOptSamples);
-      const pct = ((optMed - baseMed) / baseMed) * 100;
-      const sign = pct >= 0 ? "+" : "";
-      readoutAbLabelEl.textContent = `A/B (${abBaseDispatches} -> ${abOptDispatches})`;
-      readoutAbEl.textContent = `${baseMed.toFixed(1)} -> ${optMed.toFixed(1)} (${sign}${pct.toFixed(0)}%)`;
-      readoutAbEl.classList.toggle("is-gain", pct >= 0);
-    } else if (abOptSamples.length > 0) {
-      const optMed = medianOf(abOptSamples);
-      readoutAbLabelEl.textContent = "Live A/B";
-      readoutAbEl.textContent = `Opt ${optMed.toFixed(1)} | toggle for base`;
-      readoutAbEl.classList.remove("is-gain");
-    } else if (abBaseSamples.length > 0) {
-      const baseMed = medianOf(abBaseSamples);
-      readoutAbLabelEl.textContent = "Live A/B";
-      readoutAbEl.textContent = `Base ${baseMed.toFixed(1)} | enable opts`;
+    // Only report A/B speedup from an actual completed back-to-back race on the visitor's GPU.
+    if (abRace?.phase === "done" && abRace.baseline && abRace.optimized && abRace.speedupPct !== undefined) {
+      const sign = abRace.speedupPct >= 0 ? "+" : "";
+      readoutAbLabelEl.textContent = `A/B (${abRace.baseline.dispatchesPerTok} -> ${abRace.optimized.dispatchesPerTok})`;
+      readoutAbEl.textContent = `${abRace.baseline.avgTokPerSec.toFixed(1)} -> ${abRace.optimized.avgTokPerSec.toFixed(1)} (${sign}${abRace.speedupPct.toFixed(0)}%)`;
+      readoutAbEl.classList.toggle("is-gain", abRace.speedupPct >= 0);
+    } else if (abRace && abRace.phase !== "done") {
+      readoutAbLabelEl.textContent = "A/B Race";
+      readoutAbEl.textContent = abRace.phase === "baseline" ? "Leg 1/2 (537)..." : "Leg 2/2 (397)...";
       readoutAbEl.classList.remove("is-gain");
     } else {
-      readoutAbLabelEl.textContent = "Live A/B";
-      readoutAbEl.textContent = "--";
+      readoutAbLabelEl.textContent = "A/B Race";
+      readoutAbEl.textContent = "Run Race A/B";
       readoutAbEl.classList.remove("is-gain");
     }
   }
@@ -510,13 +600,16 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
       const key = input.dataset.opt as keyof OptFlags;
       input.checked = optFlags[key];
     }
+    const activeTarget = fault.target ?? "attention";
+    const meta = FAULT_TARGETS.find((t) => t.id === activeTarget) ?? FAULT_TARGETS[0];
     shellEl.dataset.fault = String(fault.enabled);
     faultSwitchBtn.setAttribute("aria-checked", String(fault.enabled));
     faultSwitchBtn.classList.toggle("is-on", fault.enabled);
     faultLabelEl.textContent = fault.enabled ? "ON" : "OFF";
-    faultDescEl.textContent = fault.enabled
-      ? "Online-softmax rescale inverted (-1.0): watch output and CPU parity fracture"
-      : "Corrupts online-softmax rescale mid-stream (TDR-safe)";
+    faultDescEl.textContent = fault.enabled ? meta.activeDesc : meta.armedDesc;
+    for (const btn of faultTargetBtns) {
+      btn.classList.toggle("is-active", btn.dataset.faultTarget === activeTarget);
+    }
   }
 
   function drawSparkline() {
@@ -538,11 +631,60 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     ctx.fillRect(0, 0, width, height);
 
     if (tokens.length === 0) {
+      const counts = countDispatchesForOpts(optFlags);
+      if (parityResults.length > 0) {
+        const famColor: Record<string, string> = {
+          attention: "#f59e0b",
+          qmm: "#3b82f6",
+          norm_rope: "#14b8a6",
+          swiglu: "#a855f7",
+          memory: "#64748b",
+        };
+        const n = parityResults.length;
+        const padX = 10;
+        const padT = 8;
+        const padB = 18;
+        const plotW = width - padX * 2;
+        const plotH = height - padT - padB;
+        const gap = 6;
+        const colW = Math.max(18, (plotW - gap * (n - 1)) / n);
+        const maxMs = Math.max(0.5, ...parityResults.map((r) => r.gpuMs));
+        let totalMs = 0;
+
+        for (let i = 0; i < n; i++) {
+          const r = parityResults[i];
+          totalMs += r.gpuMs;
+          const x = padX + i * (colW + gap);
+          const frac = Math.max(0.14, Math.sqrt(r.gpuMs / maxMs));
+          const bh = Math.max(6, frac * plotH);
+          const y = padT + plotH - bh;
+          const fam = KERNEL_PROVENANCE[r.kernel]?.family ?? "memory";
+          ctx.fillStyle = r.passed ? (famColor[fam] ?? "#64748b") : "#ef4444";
+          ctx.globalAlpha = r.passed ? 0.85 : 1.0;
+          ctx.fillRect(x, y, colW, bh);
+          ctx.globalAlpha = 1.0;
+
+          ctx.fillStyle = r.passed ? "#94a3b8" : "#fca5a5";
+          ctx.font = '500 9px "IBM Plex Mono", ui-monospace, monospace';
+          ctx.textAlign = "center";
+          ctx.textBaseline = "top";
+          const shortName = KERNEL_PROVENANCE[r.kernel]?.shortLabel ?? r.kernel;
+          const trimmed = shortName.length > 9 ? shortName.slice(0, 8) + "…" : shortName;
+          ctx.fillText(trimmed, x + colW / 2, padT + plotH + 4);
+        }
+
+        const failedCount = parityResults.filter((r) => !r.passed).length;
+        sparkCaptionEl.textContent =
+          failedCount > 0
+            ? `${failedCount} FAULT${failedCount === 1 ? "" : "S"} CAUGHT on boot GPU check | ${counts.totalDispatches} dispatches/tok armed`
+            : `${n}/${n} real WebGPU kernels verified (${totalMs.toFixed(1)} ms) | ${counts.totalDispatches} dispatches/tok armed`;
+        return;
+      }
+
       ctx.fillStyle = "#64748b";
       ctx.font = '500 11px "IBM Plex Mono", ui-monospace, monospace';
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      const counts = countDispatchesForOpts(optFlags);
       ctx.fillText(
         `Armed at ${counts.totalDispatches} dispatches/tok (${counts.savedDispatches} fused out vs ${counts.baselineDispatches} baseline)`,
         width / 2,
@@ -597,7 +739,10 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     }
 
     const last = recent[recent.length - 1];
-    sparkCaptionEl.textContent = `step ${last.step} | ${last.tokPerSec.toFixed(1)} tok/s | ${last.totalDispatches} dispatches/tok`;
+    const sample = recent.length > 3 ? recent.slice(1) : recent;
+    const avgMs = sample.reduce((acc, t) => acc + t.tokenMs, 0) / sample.length;
+    const avgTps = avgMs > 0 ? 1000 / avgMs : 0;
+    sparkCaptionEl.textContent = `step ${last.step} | avg ${avgTps.toFixed(1)} tok/s | ${last.totalDispatches} dispatches/tok`;
   }
 
   function renderTokens() {
@@ -695,6 +840,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
         dispatches: latestDispatches,
         optFlags,
         faultEnabled: fault.enabled,
+        faultTarget: fault.target ?? "attention",
         selectedLayer,
         selectedDispatchIndex: selectedDispatch?.index ?? null,
       });
@@ -703,6 +849,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
         kernel: selectedKernel,
         dispatch: selectedDispatch,
         faultEnabled: fault.enabled,
+        faultTarget: fault.target ?? "attention",
         parityResults,
         sampleSlice: latestSampleSlice,
       });
@@ -725,12 +872,12 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     callbacks.onZoomChange?.(level);
   }
 
-  async function triggerParityRun(faultEnabled: boolean) {
+  async function triggerParityRun(nextFault: FaultConfig) {
     if (!callbacks.onRunParity) return;
     btnParity.disabled = true;
     btnParity.textContent = "Checking...";
     try {
-      const res = await callbacks.onRunParity(faultEnabled);
+      const res = await callbacks.onRunParity({ ...nextFault });
       if (Array.isArray(res)) {
         parityResults = res;
         renderParity();
@@ -743,13 +890,33 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   }
 
   function toggleFault() {
-    fault = { enabled: !fault.enabled };
+    fault = { enabled: !fault.enabled, target: fault.target ?? "attention" };
     syncOptControls();
     callbacks.onFaultChange?.({ ...fault });
     syncSubViews();
     if (!callbacks.onFaultChange) {
-      void triggerParityRun(fault.enabled);
+      void triggerParityRun(fault);
     }
+  }
+
+  function selectFaultTarget(target: FaultTarget) {
+    fault = { enabled: fault.enabled, target };
+    const meta = FAULT_TARGETS.find((t) => t.id === target);
+    if (meta && zoom === 3) {
+      selectedKernel = meta.kernel;
+      selectedDispatch =
+        latestDispatches.find((d) => d.layer === selectedLayer && d.kernel === meta.kernel) ??
+        latestDispatches.find((d) => d.kernel === meta.kernel) ??
+        null;
+    }
+    syncOptControls();
+    if (fault.enabled) {
+      callbacks.onFaultChange?.({ ...fault });
+      if (!callbacks.onFaultChange) {
+        void triggerParityRun(fault);
+      }
+    }
+    syncSubViews();
   }
 
   // Wire controls
@@ -776,13 +943,20 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     callbacks.onGenerate?.(prompt, { ...optFlags }, { ...fault });
   });
 
+  btnRace.addEventListener("click", () => {
+    const prompt = promptEl.value.trim() || PROMPT_PRESETS[0].prompt;
+    callbacks.onRunAbRace?.(prompt);
+  });
+
   btnStop.addEventListener("click", () => {
     callbacks.onStop?.();
   });
 
   btnReset.addEventListener("click", () => {
     tokens = [];
+    abRace = null;
     latestSampleSlice = undefined;
+    renderAbRace();
     renderTokens();
     updateReadouts();
     callbacks.onReset?.();
@@ -806,8 +980,15 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
 
   faultSwitchBtn.addEventListener("click", toggleFault);
 
+  faultTargetBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const t = btn.dataset.faultTarget as FaultTarget | undefined;
+      if (t) selectFaultTarget(t);
+    });
+  });
+
   btnParity.addEventListener("click", () => {
-    void triggerParityRun(fault.enabled);
+    void triggerParityRun(fault);
   });
 
   btnPr997.addEventListener("click", () => {
@@ -902,7 +1083,6 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
         syncGenerateButton();
       }
       tokens.push(trace);
-      recordAbSample(trace);
       if (trace.dispatches.length > 0) {
         latestDispatches = trace.dispatches;
       }
@@ -916,6 +1096,11 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
       tokens = [];
       latestSampleSlice = undefined;
       renderTokens();
+      updateReadouts();
+    },
+    setAbRace(result: AbRaceResult | null) {
+      abRace = result;
+      renderAbRace();
       updateReadouts();
     },
     setParityResults(results: ParityResult[]) {
