@@ -26,7 +26,7 @@ import {
 } from "./tuning/config";
 import { runCoordinateHillClimb } from "./tuning/hill_climb";
 import { mountApp } from "./ui/app";
-import { initWebGpu, type WebGpuContext } from "./webgpu/device";
+import { initWebGpu, WebGpuUnavailableError, type WebGpuContext } from "./webgpu/device";
 import {
   verifyFastNormParity,
   verifySdpaOnlineParity,
@@ -785,7 +785,10 @@ async function boot() {
     }
   } catch (err) {
     ui.setError(err instanceof Error ? err.message : String(err));
-    document.title = "PARITY_ERROR — omarchy-mlx WebGPU";
+    document.title =
+      err instanceof WebGpuUnavailableError
+        ? "WebGPU unavailable — omarchy-mlx WebGPU"
+        : "PARITY_ERROR — omarchy-mlx WebGPU";
   }
 }
 

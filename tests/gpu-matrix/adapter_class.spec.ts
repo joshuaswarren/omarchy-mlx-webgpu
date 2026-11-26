@@ -20,7 +20,7 @@ test.describe("GPU matrix: boot parity on the project adapter class", () => {
     test.setTimeout(180_000);
     await gpuPage.goto("./");
     await gpuPage.waitForFunction(
-      () => /PARITY_(PASS|FAIL|ERROR)/.test(document.title),
+      () => /PARITY_(PASS|FAIL|ERROR)|WebGPU unavailable/.test(document.title),
       undefined,
       { timeout: 120_000 },
     );
@@ -59,7 +59,7 @@ test.describe("GPU matrix: boot parity on the project adapter class", () => {
     test.setTimeout(600_000);
     await gpuPage.goto("./");
     await gpuPage.waitForFunction(
-      () => /PARITY_(PASS|FAIL|ERROR)/.test(document.title),
+      () => /PARITY_(PASS|FAIL|ERROR)|WebGPU unavailable/.test(document.title),
       undefined,
       { timeout: 120_000 },
     );

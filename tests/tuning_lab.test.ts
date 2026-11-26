@@ -18,6 +18,7 @@ import {
   scoreTuningRun,
 } from "../src/tuning/config";
 import { runCoordinateHillClimb } from "../src/tuning/hill_climb";
+import { initWebGpu, WebGpuUnavailableError } from "../src/webgpu/device";
 
 const METAL_ADAPTER: GpuAdapterInfo = {
   vendor: "apple",
@@ -200,5 +201,9 @@ describe("Coordinate-ascent hill climber", () => {
     expect(failStep!.parityPass).toBe(false);
     expect(failStep!.score).toBe(0);
     expect(failStep!.status).toBe("parity_fail");
+  });
+
+  it("throws WebGpuUnavailableError when navigator.gpu is missing", async () => {
+    await expect(initWebGpu()).rejects.toBeInstanceOf(WebGpuUnavailableError);
   });
 });
