@@ -55,14 +55,14 @@ async function runFullParitySuite(
   faultEnabled: boolean,
 ): Promise<ParityResult[]> {
   return [
-    await verifyFastNormParity(device, 16, 1024, 1e-6, false),
-    await verifyFastRopeParity(device, 16, 128, 42, 1_000_000, false),
-    await verifyFastRopeNormParity(device, 16, 128, 42, 1e-6, 1_000_000, false),
-    await verifyQmmVecParity(device, 1024, 1024, 64, false),
-    await verifyQmmVecSwigluParity(device, 512, 1024, 64, false),
-    await verifySwigluParity(device, 3072, false),
     await verifySdpaOnlineParity(device, 16, 8, 192, faultEnabled),
     await verifySdpaSplitParity(device, 16, 8, 192, faultEnabled),
+    await verifyQmmVecParity(device, 1024, 1024, 64, false),
+    await verifyFastNormParity(device, 16, 1024, 1e-6, false),
+    await verifyFastRopeNormParity(device, 16, 128, 42, 1e-6, 1_000_000, false),
+    await verifyQmmVecSwigluParity(device, 512, 1024, 64, false),
+    await verifyFastRopeParity(device, 16, 128, 42, 1_000_000, false),
+    await verifySwigluParity(device, 3072, false),
     await verifyEmbedQ4Parity(device, 4096, 1024, 1337, 64),
     await verifyArgmaxParity(device, 151936),
   ];
