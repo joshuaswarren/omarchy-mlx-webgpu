@@ -183,7 +183,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
         </div>
         <div class="hw-strip">
           <span class="hw-chip" data-adapter>WebGPU adapter: probing</span>
-          <span class="hw-chip">${QWEN3_0_6B_4BIT.repoId} (${QWEN3_0_6B_4BIT.numHiddenLayers}L, HD=${QWEN3_0_6B_4BIT.headDim}, Q4 g${QWEN3_0_6B_4BIT.groupSize})</span>
+          <span class="hw-chip hw-chip-model">${QWEN3_0_6B_4BIT.repoId} (${QWEN3_0_6B_4BIT.numHiddenLayers}L, HD=${QWEN3_0_6B_4BIT.headDim}, Q4 g${QWEN3_0_6B_4BIT.groupSize})</span>
           <a class="hw-link" href="${PR997_BENCHMARK.repoUrl}" target="_blank" rel="noopener noreferrer">omarchy-mlx</a>
         </div>
       </header>
@@ -244,9 +244,13 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
               </div>
               <div class="stream-output" data-token-stream aria-live="polite">
                 <div class="stream-empty">
-                  Click <b>Load &amp; Generate</b> to stream tokens on your GPU, or click <b>Race A/B</b> to benchmark
-                  537 unfused vs 397 optimized dispatches back-to-back. Switch to <b>2 Kernel graph</b> or
-                  <b>3 Dispatch &amp; shader</b> anytime to inspect live dispatches.
+                  <div class="hero-lead">Real Qwen3-0.6B-4bit shaders running on your GPU in this tab.</div>
+                  <div class="hero-sub">Every kernel is verified against CPU on boot. Generate live tokens, race unfused vs fused dispatches, or hill-climb 9 real GPU levers.</div>
+                  <div class="hero-cta-row">
+                    <button type="button" class="btn-primary hero-cta-btn" data-hero-generate>Load &amp; Generate</button>
+                    <button type="button" class="btn-secondary hero-cta-btn hero-cta-tune" data-hero-tuning>9-Lever Tuning Lab</button>
+                    <button type="button" class="btn-ghost hero-cta-btn" data-hero-race>Race A/B</button>
+                  </div>
                 </div>
               </div>
               <div class="ab-race-card" data-ab-race hidden></div>
@@ -727,13 +731,13 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
           memory: "#64748b",
         };
         const n = parityResults.length;
-        const padX = 10;
+        const padX = width < 420 ? 6 : 10;
         const padT = 8;
         const padB = 18;
         const plotW = width - padX * 2;
         const plotH = height - padT - padB;
-        const gap = 6;
-        const colW = Math.max(18, (plotW - gap * (n - 1)) / n);
+        const gap = width < 420 ? 3 : 6;
+        const colW = Math.max(8, (plotW - gap * (n - 1)) / n);
         const maxMs = Math.max(0.5, ...parityResults.map((r) => r.gpuMs));
         let totalMs = 0;
 
@@ -751,11 +755,13 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
           ctx.globalAlpha = 1.0;
 
           ctx.fillStyle = r.passed ? "#94a3b8" : "#fca5a5";
-          ctx.font = '500 9px "IBM Plex Mono", ui-monospace, monospace';
+          const labelFontPx = colW < 34 ? 7.5 : 9;
+          ctx.font = `500 ${labelFontPx}px "IBM Plex Mono", ui-monospace, monospace`;
           ctx.textAlign = "center";
           ctx.textBaseline = "top";
           const shortName = KERNEL_PROVENANCE[r.kernel]?.shortLabel ?? r.kernel;
-          const trimmed = shortName.length > 9 ? shortName.slice(0, 8) + "…" : shortName;
+          const maxChars = colW < 34 ? Math.max(3, Math.floor(colW / 4.8)) : 9;
+          const trimmed = shortName.length > maxChars ? shortName.slice(0, Math.max(2, maxChars - 1)) + "…" : shortName;
           ctx.fillText(trimmed, x + colW / 2, padT + plotH + 4);
         }
 
@@ -840,9 +846,15 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   function renderTokens() {
     tokenCountEl.textContent = `${tokens.length} token${tokens.length === 1 ? "" : "s"} generated`;
     if (tokens.length === 0) {
+      const genLabel = modelLoaded ? "Generate" : "Load & Generate";
       tokenStreamEl.innerHTML = `<div class="stream-empty">
-        Enter a prompt on the right and click <b>Generate</b> to stream tokens directly from your GPU.
-        Switch to <b>2 Kernel graph</b> or <b>3 Dispatch &amp; shader</b> anytime to inspect live dispatches.
+        <div class="hero-lead">Real Qwen3-0.6B-4bit shaders running on your GPU in this tab.</div>
+        <div class="hero-sub">Every kernel is verified against CPU on boot. Generate live tokens, race unfused vs fused dispatches, or hill-climb 9 real GPU levers.</div>
+        <div class="hero-cta-row">
+          <button type="button" class="btn-primary hero-cta-btn" data-hero-generate ${generating || modelLoading ? "disabled" : ""}>${genLabel}</button>
+          <button type="button" class="btn-secondary hero-cta-btn hero-cta-tune" data-hero-tuning>9-Lever Tuning Lab</button>
+          <button type="button" class="btn-ghost hero-cta-btn" data-hero-race ${generating || modelLoading ? "disabled" : ""}>Race A/B</button>
+        </div>
       </div>`;
       drawSparkline();
       return;
@@ -1104,7 +1116,20 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   });
 
   tokenStreamEl.addEventListener("click", (ev) => {
-    const target = (ev.target as HTMLElement | null)?.closest<HTMLElement>("[data-token-idx]");
+    const el = ev.target as HTMLElement | null;
+    if (el?.closest("[data-hero-generate]")) {
+      btnGenerate.click();
+      return;
+    }
+    if (el?.closest("[data-hero-tuning]")) {
+      setZoom(4);
+      return;
+    }
+    if (el?.closest("[data-hero-race]")) {
+      btnRace.click();
+      return;
+    }
+    const target = el?.closest<HTMLElement>("[data-token-idx]");
     if (!target) return;
     const idx = Number(target.dataset.tokenIdx);
     const tr = tokens[idx];
