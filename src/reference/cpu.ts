@@ -205,6 +205,132 @@ export function embedQ4Cpu(
   return out;
 }
 
+/** Fused per-head RMSNorm + half-split RoPE reference (matching fast_rope_norm.comp). */
+export function ropeNormCpu(
+  input: Float32Array,
+  weight: Float32Array,
+  heads: number,
+  headDim: number,
+  position: number,
+  eps: number,
+  ropeTheta: number,
+): Float32Array {
+  const normed = rmsNormCpu(input, weight, heads, headDim, eps);
+  return ropeCpu(normed, heads, headDim, position, ropeTheta);
+}
+
+/** Fused Gate + Up Q4 affine QMM + SwiGLU reference (matching qmm_vec.comp QMM_VEC_SWIGLU). */
+export function qmmSwigluQ4Cpu(
+  x: Float32Array,
+  gateWeightsU32: Uint32Array,
+  gateScalesF32: Float32Array,
+  gateBiasesF32: Float32Array,
+  upWeightsU32: Uint32Array,
+  upScalesF32: Float32Array,
+  upBiasesF32: Float32Array,
+  N: number,
+  K: number,
+  groupSize = 64,
+): Float32Array {
+  const gate = qmmQ4Cpu(x, gateWeightsU32, gateScalesF32, gateBiasesF32, N, K, groupSize);
+  const up = qmmQ4Cpu(x, upWeightsU32, upScalesF32, upBiasesF32, N, K, groupSize);
+  return swigluCpu(gate, up);
+}
+
+/** Elementwise residual add: out[i] = a[i] + b[i]. */
+export function residualAddCpu(a: Float32Array, b: Float32Array): Float32Array {
+  const n = Math.min(a.length, b.length);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = a[i] + b[i];
+  }
+  return out;
+}
+
+/**
+ * Single-token KV cache scatter write into [kvHeads, maxSeq, headDim] at position `pos`.
+ * Returns updated copies of `kCache` and `vCache` without mutating caller arrays.
+ */
+export function kvCacheWriteCpu(
+  kIn: Float32Array,
+  vIn: Float32Array,
+  kCache: Float32Array,
+  vCache: Float32Array,
+  kvHeads: number,
+  headDim: number,
+  maxSeq: number,
+  pos: number,
+): { kCache: Float32Array; vCache: Float32Array } {
+  const nextK = new Float32Array(kCache);
+  const nextV = new Float32Array(vCache);
+  for (let h = 0; h < kvHeads; h++) {
+    const srcBase = h * headDim;
+    const dstBase = (h * maxSeq + pos) * headDim;
+    for (let d = 0; d < headDim; d++) {
+      nextK[dstBase + d] = kIn[srcBase + d];
+      nextV[dstBase + d] = vIn[srcBase + d];
+    }
+  }
+  return { kCache: nextK, vCache: nextV };
+}
+
+/** Deterministic argmax with lowest-index tie-breaking (matching elem.wgsl argmax_p1/p2). */
+export function argmaxCpu(logits: Float32Array): { index: number; value: number } {
+  if (logits.length === 0) {
+    return { index: -1, value: -Infinity };
+  }
+  let bestIdx = 0;
+  let bestVal = logits[0];
+  for (let i = 1; i < logits.length; i++) {
+    const v = logits[i];
+    if (v > bestVal) {
+      bestVal = v;
+      bestIdx = i;
+    }
+  }
+  return { index: bestIdx, value: bestVal };
+}
+
+export interface QuantizedQ4Matrix {
+  weightsU32: Uint32Array;
+  scalesF32: Float32Array;
+  biasesF32: Float32Array;
+}
+
+/** Deterministic MLX affine 4-bit (g64) quantized weight generator for parity tests. */
+export function seededQ4Weights(
+  N: number,
+  K: number,
+  seed: number,
+  groupSize = 64,
+): QuantizedQ4Matrix {
+  const wordsPerRow = K >>> 3;
+  const groupsPerRow = Math.floor(K / groupSize);
+  const weightsU32 = new Uint32Array(N * wordsPerRow);
+  const scalesF32 = new Float32Array(N * groupsPerRow);
+  const biasesF32 = new Float32Array(N * groupsPerRow);
+
+  let state = seed >>> 0;
+  const nextU32 = (): number => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return (t ^ (t >>> 14)) >>> 0;
+  };
+
+  for (let i = 0; i < weightsU32.length; i++) {
+    weightsU32[i] = nextU32();
+  }
+  for (let i = 0; i < scalesF32.length; i++) {
+    const uScale = nextU32() / 4294967296;
+    const uBias = nextU32() / 4294967296;
+    scalesF32[i] = 0.005 + uScale * 0.04;
+    biasesF32[i] = (uBias * 2 - 1) * 0.15;
+  }
+
+  return { weightsU32, scalesF32, biasesF32 };
+}
+
 /** Deterministic PRNG (Mulberry32) for reproducible parity test vectors. */
 export function seededFloat32(length: number, seed: number, scale = 1.0): Float32Array {
   let state = seed >>> 0;
