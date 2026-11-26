@@ -138,6 +138,9 @@ fn main(
         o3 = o3 * factor + p * v3;
       }
     }
+    // Synchronize before next iteration writes s_dot[t], preventing a WAR race
+    // on non-lockstep adapters (e.g. SwiftShader, 16-wide Intel, 64-wide AMD).
+    workgroupBarrier();
   }
 
   if (sg < k_len) {
