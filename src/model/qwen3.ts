@@ -950,6 +950,7 @@ export class Qwen3WebGpuEngine {
     const eosSet = new Set(this.config.eosTokenIds);
     const budget = Math.min(maxNewTokens, MAX_SEQ - promptIds.length - 1);
     const decodeWallStart = performance.now();
+    let compileOverheadMs = 0;
 
     for (let step = 0; step < budget; step++) {
       if (shouldStop()) break;
@@ -959,6 +960,12 @@ export class Qwen3WebGpuEngine {
       const wantTrace =
         exec.decodePacing === "every_token" ||
         (exec.decodePacing === "every_4" && (step === 0 || step % 4 === 3));
+
+      // Pre-compile variant pipelines before timing this token so mid-generation lever flips
+      // never include WGSL compilation latency in tokenMs or avgTokPerSec.
+      const compileStart = performance.now();
+      await this.resolveVariantPipelines(exec);
+      compileOverheadMs += performance.now() - compileStart;
 
       const t0 = performance.now();
       const res = await this.forwardStep(curToken, pos, opts, fault, true, wantTrace, exec);
@@ -997,7 +1004,7 @@ export class Qwen3WebGpuEngine {
       }
     }
 
-    const totalWallMs = Math.max(0.01, performance.now() - decodeWallStart);
+    const totalWallMs = Math.max(0.01, performance.now() - decodeWallStart - compileOverheadMs);
     return {
       tokens: generated,
       text: decodedSoFar,

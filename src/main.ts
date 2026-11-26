@@ -69,6 +69,7 @@ export interface OmarchyLabApi {
     start?: "baseline" | "current";
     prompt?: string;
     tokens?: number;
+    maxPasses?: number;
   }) => Promise<HillClimbReport>;
   read: () => {
     adapter: GpuAdapterInfo | null;
@@ -78,7 +79,7 @@ export interface OmarchyLabApi {
     history: TuningEvalResult[];
     shareUrl: string;
   };
-  shareUrl: (config?: Partial<TuningConfig>) => string;
+  shareUrl: (config?: Partial<TuningConfig>, prompt?: string) => string;
   stop: () => void;
 }
 
@@ -192,13 +193,18 @@ async function boot() {
   let evalHistory: TuningEvalResult[] = [];
   let manualStepCounter = 0;
 
-  const buildShareUrl = (cfg?: Partial<TuningConfig>): string => {
+  const getCustomPrompt = (override?: string): string | undefined => {
+    const raw = (override ?? ui.getPrompt()).trim();
+    return raw.length > 0 && raw !== DEFAULT_PROMPT ? raw : undefined;
+  };
+
+  const buildShareUrl = (cfg?: Partial<TuningConfig>, promptOverride?: string): string => {
     const target = cfg
       ? normalizeTuningConfig(cfg, gpu?.info ?? null, tuningConfig)
       : bestEval && bestEval.score > 0
         ? bestEval.config
         : tuningConfig;
-    return encodeConfigToUrl(target, pageOriginPath, true);
+    return encodeConfigToUrl(target, pageOriginPath, true, getCustomPrompt(promptOverride));
   };
 
   const publishLabState = (climbing = false) => {
@@ -236,7 +242,12 @@ async function boot() {
       });
     }
     if (syncUrl && typeof history !== "undefined" && history.replaceState) {
-      const nextUrl = encodeConfigToUrl(tuningConfig, pageOriginPath, ui.getState().zoom === 4);
+      const nextUrl = encodeConfigToUrl(
+        tuningConfig,
+        pageOriginPath,
+        ui.getState().zoom === 4,
+        getCustomPrompt(),
+      );
       history.replaceState(null, "", nextUrl);
     }
     publishLabState(false);
@@ -349,7 +360,7 @@ async function boot() {
       parityPass: scored.parityPass,
       score: scored.score,
       status: scored.parityPass ? "manual" : "parity_fail",
-      shareUrl: encodeConfigToUrl(normalized, pageOriginPath, true),
+      shareUrl: encodeConfigToUrl(normalized, pageOriginPath, true, getCustomPrompt(prompt)),
       timestampMs: Date.now(),
     };
   };
@@ -361,7 +372,10 @@ async function boot() {
     label?: string;
   }): Promise<TuningEvalResult> => {
     stopRequested = false;
-    const prompt = options?.prompt ?? ui.getPrompt();
+    if (options?.prompt !== undefined) {
+      ui.setPrompt(options.prompt);
+    }
+    const prompt = ui.getPrompt();
     const tokenBudget = options?.tokens ?? 24;
     if (options?.config) {
       applyTuningPatch(options.config, true);
@@ -406,9 +420,13 @@ async function boot() {
     start?: "baseline" | "current";
     prompt?: string;
     tokens?: number;
+    maxPasses?: number;
   }): Promise<HillClimbReport> => {
     stopRequested = false;
-    const prompt = options?.prompt ?? ui.getPrompt();
+    if (options?.prompt !== undefined) {
+      ui.setPrompt(options.prompt);
+    }
+    const prompt = ui.getPrompt();
     const tokenBudget = options?.tokens ?? 24;
     const startMode = options?.start ?? "baseline";
     const startCfg =
@@ -431,6 +449,7 @@ async function boot() {
         startConfig: startCfg,
         adapter: gpu?.info ?? null,
         referenceTokens: refTokens,
+        maxPasses: options?.maxPasses,
         evaluate: async (cfg, label, step) => {
           applyTuningPatch(cfg, false);
           ui.setStatus(`Hill Climb step ${step}: testing ${label}…`, "busy");
@@ -453,8 +472,9 @@ async function boot() {
         applyTuningPatch(report.best.config, true);
       }
       publishLabState(false);
+      const passTag = report.passesCompleted > 1 ? `, ${report.passesCompleted} passes` : "";
       ui.setStatus(
-        `Hill Climb complete: ${report.baseline.score.toFixed(1)} -> ${report.best.score.toFixed(1)} tok/s (+${report.gainPct.toFixed(1)}%, ${report.best.dispatchesPerTok} disp/tok, ${report.best.parityMatched}/${report.best.parityTotal} exact)`,
+        `Hill Climb complete: ${report.baseline.score.toFixed(1)} -> ${report.best.score.toFixed(1)} tok/s (+${report.gainPct.toFixed(1)}%, ${report.best.dispatchesPerTok} disp/tok${passTag}, ${report.best.parityMatched}/${report.best.parityTotal} exact)`,
         "ok",
       );
       return report;
@@ -733,7 +753,7 @@ async function boot() {
       history: [...evalHistory],
       shareUrl: buildShareUrl(),
     }),
-    shareUrl: (cfg) => buildShareUrl(cfg),
+    shareUrl: (cfg, prompt) => buildShareUrl(cfg, prompt),
     stop: () => {
       stopRequested = true;
     },

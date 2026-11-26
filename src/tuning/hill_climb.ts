@@ -12,6 +12,8 @@ export interface HillClimbOptions {
   startConfig: TuningConfig;
   adapter: GpuAdapterInfo | null;
   referenceTokens: number[];
+  /** Maximum coordinate-ascent sweeps over all levers (default 2; stops early once a pass finds no gain). */
+  maxPasses?: number;
   evaluate: (
     config: TuningConfig,
     label: string,
@@ -22,7 +24,11 @@ export interface HillClimbOptions {
 }
 
 /**
- * Deterministic coordinate-ascent hill climber over all supported GPU levers.
+ * Deterministic multi-pass coordinate-ascent hill climber over all supported GPU levers.
+ *
+ * Revisits earlier levers in subsequent passes so interactions unlocked by later levers
+ * (for example workgroup size or fusions changing the optimal batching/pacing) are found,
+ * while skipping already-visited configurations and stopping as soon as a pass converges.
  *
  * Strictly enforces the parity gate: any candidate that alters output tokens
  * scores 0 and is rejected immediately (`status = "parity_fail"`).
@@ -31,6 +37,7 @@ export async function runCoordinateHillClimb(
   opts: HillClimbOptions,
 ): Promise<HillClimbReport> {
   const { prompt, tokenBudget, adapter, referenceTokens, evaluate, onStep, shouldStop } = opts;
+  const maxPasses = Math.max(1, Math.min(4, Math.floor(opts.maxPasses ?? 2)));
   const steps: TuningEvalResult[] = [];
   const visited = new Set<string>();
 
@@ -63,50 +70,71 @@ export async function runCoordinateHillClimb(
 
   let stepNum = 1;
   let stoppedEarly = false;
+  let passesCompleted = 0;
 
-  for (const key of leverOrder) {
+  for (let pass = 1; pass <= maxPasses; pass++) {
     if (shouldStop?.()) {
       stoppedEarly = true;
       break;
     }
-    const spec = specs.find((s) => s.key === key);
-    if (!spec) continue;
 
-    // Test every supported alternative value for this lever relative to current best
-    for (const candidateVal of spec.supportedValues) {
+    let improvedInPass = false;
+    let evaluatedInPass = 0;
+
+    for (const key of leverOrder) {
       if (shouldStop?.()) {
         stoppedEarly = true;
         break;
       }
-      if (best.config[key] === candidateVal) continue;
+      const spec = specs.find((s) => s.key === key);
+      if (!spec) continue;
 
-      const candidateCfg = normalizeTuningConfig(
-        { ...best.config, [key]: candidateVal },
-        adapter,
-        best.config,
-      );
-      const ck = configKey(candidateCfg);
-      if (visited.has(ck)) continue;
-      visited.add(ck);
+      // Test every supported alternative value for this lever relative to current best
+      for (const candidateVal of spec.supportedValues) {
+        if (shouldStop?.()) {
+          stoppedEarly = true;
+          break;
+        }
+        if (best.config[key] === candidateVal) continue;
 
-      const label = `${spec.urlParam}=${String(candidateVal)}`;
-      const raw = await evaluate(candidateCfg, label, stepNum++);
+        const candidateCfg = normalizeTuningConfig(
+          { ...best.config, [key]: candidateVal },
+          adapter,
+          best.config,
+        );
+        const ck = configKey(candidateCfg);
+        if (visited.has(ck)) continue;
+        visited.add(ck);
+        evaluatedInPass++;
 
-      let status: TuningEvalResult["status"];
-      if (!raw.parityPass) {
-        status = "parity_fail";
-      } else if (raw.score > best.score) {
-        status = "accepted";
-      } else {
-        status = "rejected";
+        const baseLabel = `${spec.urlParam}=${String(candidateVal)}`;
+        const label = pass > 1 ? `p${pass}: ${baseLabel}` : baseLabel;
+        const raw = await evaluate(candidateCfg, label, stepNum++);
+
+        let status: TuningEvalResult["status"];
+        if (!raw.parityPass) {
+          status = "parity_fail";
+        } else if (raw.score > best.score) {
+          status = "accepted";
+        } else {
+          status = "rejected";
+        }
+
+        const recorded: TuningEvalResult = { ...raw, status };
+        steps.push(recorded);
+        if (status === "accepted") {
+          best = recorded;
+          improvedInPass = true;
+        }
+        onStep?.(recorded, best, [...steps]);
       }
+    }
 
-      const recorded: TuningEvalResult = { ...raw, status };
-      steps.push(recorded);
-      if (status === "accepted") {
-        best = recorded;
-      }
-      onStep?.(recorded, best, [...steps]);
+    if (evaluatedInPass > 0 || pass === 1) {
+      passesCompleted = pass;
+    }
+    if (stoppedEarly || !improvedInPass) {
+      break;
     }
   }
 
@@ -123,6 +151,7 @@ export async function runCoordinateHillClimb(
     baseline,
     best,
     steps,
+    passesCompleted,
     gainPct,
     shareUrl: best.shareUrl,
     stoppedEarly,
