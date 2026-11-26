@@ -29,13 +29,17 @@ export const test = base.extend<{ gpuPage: Page }>({
       ? await chromium.connectOverCDP(cdp)
       : await chromium.launch({ args: row.launchArgs });
     const context = await browser.newContext({
-      baseURL,
+      // Trailing slash keeps "./" gotos on a subpath (e.g. /omarchy-mlx-webgpu/)
+      baseURL: baseURL.endsWith("/") ? baseURL : `${baseURL}/`,
       viewport: { width: 1440, height: 920 },
     });
     const page = await context.newPage();
-    await use(page);
-    await context.close();
-    await browser.close();
+    try {
+      await use(page);
+    } finally {
+      await context.close();
+      await browser.close();
+    }
   },
 });
 

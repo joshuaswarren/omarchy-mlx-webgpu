@@ -18,7 +18,7 @@ interface ParityReport {
 test.describe("GPU matrix: boot parity on the project adapter class", () => {
   test("boot parity passes and the adapter is the expected class", async ({ gpuPage }) => {
     test.setTimeout(180_000);
-    await gpuPage.goto("/");
+    await gpuPage.goto("./");
     await gpuPage.waitForFunction(
       () => /PARITY_(PASS|FAIL|ERROR)/.test(document.title),
       undefined,
@@ -57,7 +57,7 @@ test.describe("GPU matrix: boot parity on the project adapter class", () => {
   test("short generation on the same adapter", async ({ gpuPage }) => {
     test.skip(!process.env.GPU_MATRIX_GENERATE, "set GPU_MATRIX_GENERATE=1 for the model-load smoke");
     test.setTimeout(600_000);
-    await gpuPage.goto("/");
+    await gpuPage.goto("./");
     await gpuPage.waitForFunction(
       () => /PARITY_(PASS|FAIL|ERROR)/.test(document.title),
       undefined,
