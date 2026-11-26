@@ -1,17 +1,26 @@
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { parseSafetensors, getTensorAsFloat32, getTensorU32Slice } from "../src/model/safetensors";
 import { Qwen3Tokenizer } from "../src/model/tokenizer";
 import {
+  argmaxCpu,
   bf16ToF32,
   compareArrays,
   embedQ4Cpu,
+  kvCacheWriteCpu,
   qmmQ4Cpu,
+  qmmSwigluQ4Cpu,
+  residualAddCpu,
   rmsNormCpu,
   ropeCpu,
+  ropeNormCpu,
   sdpaDecodeCpu,
   seededFloat32,
+  seededQ4Weights,
   swigluCpu,
 } from "../src/reference/cpu";
+import { argmaxNumBlocks, qmmDispatchGrid } from "../src/webgpu/parity_kernels";
 
 describe("CPU reference kernels", () => {
   it("RMSNorm normalizes unit vector with weight 1", () => {
@@ -58,6 +67,118 @@ describe("CPU reference kernels", () => {
     const m = compareArrays(new Float32Array([0, 0, 0]), new Float32Array([1, 2, 3]));
     expect(m.cosineSimilarity).toBe(0);
   });
+
+  it("Fused RMSNorm + RoPE matches sequential rmsNormCpu then ropeCpu", () => {
+    const x = seededFloat32(16 * 128, 11, 1.5);
+    const w = seededFloat32(128, 12, 1.0);
+    const fused = ropeNormCpu(x, w, 16, 128, 42, 1e-6, 1_000_000);
+    const seq = ropeCpu(rmsNormCpu(x, w, 16, 128, 1e-6), 16, 128, 42, 1_000_000);
+    expect(compareArrays(fused, seq).maxAbsDiff).toBe(0);
+    const atZero = ropeNormCpu(x, w, 16, 128, 0, 1e-6, 1_000_000);
+    expect(compareArrays(atZero, rmsNormCpu(x, w, 16, 128, 1e-6)).maxAbsDiff).toBeLessThan(1e-6);
+  });
+
+  it("Fused Gate+Up Q4 QMM + SwiGLU matches separate projections + swigluCpu", () => {
+    const x = seededFloat32(256, 21, 0.5);
+    const gate = seededQ4Weights(64, 256, 22, 64);
+    const up = seededQ4Weights(64, 256, 23, 64);
+    const fused = qmmSwigluQ4Cpu(
+      x,
+      gate.weightsU32,
+      gate.scalesF32,
+      gate.biasesF32,
+      up.weightsU32,
+      up.scalesF32,
+      up.biasesF32,
+      64,
+      256,
+      64,
+    );
+    const gOut = qmmQ4Cpu(x, gate.weightsU32, gate.scalesF32, gate.biasesF32, 64, 256, 64);
+    const uOut = qmmQ4Cpu(x, up.weightsU32, up.scalesF32, up.biasesF32, 64, 256, 64);
+    expect(compareArrays(fused, swigluCpu(gOut, uOut)).maxAbsDiff).toBe(0);
+  });
+
+  it("Residual add, KV cache write, deterministic argmax, and dispatch helpers match spec", () => {
+    const a = new Float32Array([1.5, -2.25, 0.5, 4.0]);
+    const b = new Float32Array([-0.5, 2.25, 1.25, -1.0]);
+    expect(Array.from(residualAddCpu(a, b))).toEqual([1.0, 0.0, 1.75, 3.0]);
+
+    const kvHeads = 2;
+    const headDim = 4;
+    const maxSeq = 3;
+    const pos = 1;
+    const kIn = new Float32Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const vIn = new Float32Array([-1, -2, -3, -4, -5, -6, -7, -8]);
+    const zeros = new Float32Array(kvHeads * maxSeq * headDim);
+    const { kCache, vCache } = kvCacheWriteCpu(kIn, vIn, zeros, zeros, kvHeads, headDim, maxSeq, pos);
+    expect(Array.from(kCache.slice(4, 8))).toEqual([1, 2, 3, 4]);
+    expect(Array.from(kCache.slice(16, 20))).toEqual([5, 6, 7, 8]);
+    expect(Array.from(vCache.slice(16, 20))).toEqual([-5, -6, -7, -8]);
+    expect(kCache[0]).toBe(0);
+    expect(kCache[8]).toBe(0);
+
+    const neg = new Float32Array([-9.5, -3.25, -4.0, -3.25]);
+    expect(argmaxCpu(neg)).toEqual({ index: 1, value: -3.25 });
+
+    expect(qmmDispatchGrid(151936)).toEqual([18992, 1, 1]);
+    expect(qmmDispatchGrid(600000)).toEqual([65535, 2, 1]);
+    expect(argmaxNumBlocks(151936)).toBe(256);
+  });
+});
+
+describe("WGSL portability guardrails", () => {
+  const wgslFiles = [
+    "fast_rope.wgsl",
+    "fast_rope_norm.wgsl",
+    "qmm_vec.wgsl",
+    "qmm_vec_swiglu.wgsl",
+    "swiglu.wgsl",
+    "elem.wgsl",
+  ];
+  const forbiddenReserved = [
+    "active",
+    "filter",
+    "target",
+    "shared",
+    "static",
+    "set",
+    "get",
+    "match",
+    "self",
+    "super",
+    "mod",
+    "use",
+    "null",
+    "void",
+    "class",
+    "enum",
+    "union",
+  ];
+
+  for (const file of wgslFiles) {
+    it(`${file} uses portable WGSL (f32, <=16KB workgroup mem, no subgroup ext, no reserved words)`, () => {
+      const src = readFileSync(resolve(import.meta.dir, "../src/kernels/wgsl", file), "utf8");
+      const codeOnly = src
+        .replace(/\/\/[^\n]*/g, "")
+        .replace(/\/\*[\s\S]*?\*\//g, "");
+
+      expect(codeOnly).not.toMatch(/\benable\s+(subgroups|f16)\b/);
+
+      let wgBytes = 0;
+      for (const m of codeOnly.matchAll(/var<workgroup>\s+\w+\s*:\s*array<(f32|u32|i32)\s*,\s*(\d+)>/g)) {
+        wgBytes += Number(m[2]) * 4;
+      }
+      expect(wgBytes).toBeLessThanOrEqual(16384);
+
+      const bindings = [...codeOnly.matchAll(/@binding\((\d+)\)/g)].map((m) => Number(m[1]));
+      expect(new Set(bindings).size).toBe(bindings.length);
+
+      for (const kw of forbiddenReserved) {
+        expect(codeOnly).not.toMatch(new RegExp(`\\b${kw}\\b`));
+      }
+    });
+  }
 });
 
 describe("Safetensors parser & Qwen3 BPE tokenizer", () => {
