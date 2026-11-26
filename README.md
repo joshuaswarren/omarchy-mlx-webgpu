@@ -11,7 +11,8 @@ Zero backend servers. Zero paid APIs. Weights stream once from Hugging Face and 
 1. **Zoom Level 1 — Token stream**: Watch `Qwen3-0.6B-4bit` generate text live on your GPU with per-token `tok/s`, live `dispatches/token`, and a scrolling throughput/dispatch waveform.
 2. **Zoom Level 2 — Kernel graph**: Inspect all 28 transformer layers and the per-layer dispatch waterfall (`537` unfused dispatches/token down to `397` with all three fusions enabled).
 3. **Zoom Level 3 — Dispatch & shader inspector**: Click any kernel to inspect its workgroup grid, 64-dim WebGPU-vs-CPU diff heatmap, and side-by-side `omarchy-mlx` Vulkan GLSL vs browser WebGPU WGSL source.
-4. **Real optimization toggles**:
+4. **Zoom Level 4 — Tuning Lab & Agent Hill Climber**: Experiment with 8 real GPU execution levers (3 kernel fusions, QMM workgroup size `64 / 128 / 256`, `f32 / f16 / f16_accum` precision, hardware `subgroupAdd`, command-pass/queue batching, and decode pacing), see live parity-gated scores (`score = tok/s` on exact token match, `0` if output diverges), run the built-in coordinate-ascent **Hill Climb**, copy a **Share Link** for the winning config, or drive automated climbs via URL parameters and the `window.omarchyLab` JSON API (documented in [AGENTS.md](AGENTS.md)).
+5. **Real optimization toggles**:
    - **[PR #997](https://github.com/joshuaswarren/omarchy-mlx/pull/997) one-dispatch online-softmax attention** (`sdpa_decode_online.wgsl` vs 2-dispatch `sdpa_decode_split_p1/p2.wgsl`, `-28` dispatches/token)
    - **Fused QK-Norm + RoPE** (`fast_rope_norm.wgsl`, `-56` dispatches/token)
    - **Fused Gate+Up Q4 QMM + SwiGLU** (`qmm_vec_swiglu.wgsl`, `-56` dispatches/token)

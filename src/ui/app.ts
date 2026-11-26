@@ -10,6 +10,8 @@ import {
   type OptFlags,
   type ParityResult,
   type TokenTrace,
+  type TuningConfig,
+  type TuningEvalResult,
 } from "../kernels/types";
 import { PR997_BENCHMARK, PUBLIC_APPLE_SILICON_HIGHLIGHTS } from "../data/public_benchmarks";
 import { QWEN3_0_6B_4BIT } from "../model/config";
@@ -18,10 +20,15 @@ import {
   buildSyntheticSchedule,
   countDispatchesForOpts,
 } from "../kernels/provenance";
+import {
+  DEFAULT_TUNING_CONFIG,
+  encodeConfigToUrl,
+} from "../tuning/config";
 import { createKernelGraphView } from "./zoom_canvas";
 import { createInspectorView } from "./inspector";
+import { createTuningLabView } from "./tuning_lab";
 
-export type ZoomLevel = 1 | 2 | 3;
+export type ZoomLevel = 1 | 2 | 3 | 4;
 
 export interface AppCallbacks {
   onGenerate?: (prompt: string, opts: OptFlags, fault: FaultConfig) => void | Promise<void>;
@@ -32,6 +39,10 @@ export interface AppCallbacks {
   onFaultChange?: (fault: FaultConfig) => void;
   onRunParity?: (fault: FaultConfig | boolean) => void | Promise<ParityResult[]>;
   onZoomChange?: (level: ZoomLevel) => void;
+  onTuningConfigChange?: (patch: Partial<TuningConfig>) => void;
+  onRunTuningBenchmark?: (prompt: string) => void | Promise<void>;
+  onRunHillClimb?: (prompt: string) => void | Promise<void>;
+  onResetTuningBaseline?: () => void;
 }
 
 export interface AppController {
@@ -41,6 +52,16 @@ export interface AppController {
   pushTokenTrace(trace: TokenTrace): void;
   clearTokens(): void;
   setAbRace(result: AbRaceResult | null): void;
+  setTuningState(next: {
+    config?: TuningConfig;
+    climbing?: boolean;
+    lastEval?: TuningEvalResult | null;
+    bestEval?: TuningEvalResult | null;
+    history?: TuningEvalResult[];
+    shareUrl?: string;
+  }): void;
+  setPrompt(prompt: string): void;
+  getPrompt(): string;
   setParityResults(results: ParityResult[]): void;
   setOptFlags(opts: OptFlags): void;
   setFaultConfig(fault: FaultConfig): void;
@@ -54,6 +75,7 @@ export interface AppController {
     generating: boolean;
     selectedLayer: number;
     selectedKernel: KernelId;
+    tuningConfig: TuningConfig;
   };
   destroy(): void;
 }
@@ -135,6 +157,18 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   let tokens: TokenTrace[] = [];
   let abRace: AbRaceResult | null = null;
   let parityResults: ParityResult[] = [];
+  let adapterInfo: GpuAdapterInfo | null = null;
+  let tuningConfig: TuningConfig = { ...DEFAULT_TUNING_CONFIG };
+  let tuningClimbing = false;
+  let tuningLastEval: TuningEvalResult | null = null;
+  let tuningBestEval: TuningEvalResult | null = null;
+  let tuningHistory: TuningEvalResult[] = [];
+  let tuningShareUrl =
+    typeof window !== "undefined"
+      ? encodeConfigToUrl(DEFAULT_TUNING_CONFIG, window.location.origin + window.location.pathname)
+      : "";
+  let tuningCopied = false;
+  let copiedTimer: number | null = null;
   let latestDispatches: DispatchEvent[] = buildSyntheticSchedule(optFlags, 192);
   let latestSampleSlice: Float32Array | undefined;
   let showPr997Table = false;
@@ -175,6 +209,9 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
               </button>
               <button type="button" role="tab" class="zoom-tab" data-zoom="3" aria-selected="false">
                 <kbd>3</kbd> Dispatch &amp; shader
+              </button>
+              <button type="button" role="tab" class="zoom-tab" data-zoom="4" aria-selected="false">
+                <kbd>4</kbd> Tuning Lab
               </button>
             </nav>
 
@@ -223,6 +260,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
 
             <div class="view-pane" data-pane="2" hidden></div>
             <div class="view-pane" data-pane="3" hidden></div>
+            <div class="view-pane" data-pane="4" hidden></div>
           </div>
         </div>
 
@@ -410,6 +448,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   const pane1 = root.querySelector<HTMLElement>('[data-pane="1"]')!;
   const pane2 = root.querySelector<HTMLElement>('[data-pane="2"]')!;
   const pane3 = root.querySelector<HTMLElement>('[data-pane="3"]')!;
+  const pane4 = root.querySelector<HTMLElement>('[data-pane="4"]')!;
 
   const readoutTpsEl = root.querySelector<HTMLElement>("[data-readout-tps]")!;
   const readoutDispEl = root.querySelector<HTMLElement>("[data-readout-disp]")!;
@@ -461,6 +500,42 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
         latestDispatches.find((d) => d.kernel === kernel) ??
         null;
       syncSubViews();
+    },
+  });
+
+  const tuningLab = createTuningLabView(pane4, {
+    onConfigChange(patch) {
+      callbacks.onTuningConfigChange?.(patch);
+    },
+    onRunBenchmark() {
+      const prompt = promptEl.value.trim() || PROMPT_PRESETS[0].prompt;
+      return callbacks.onRunTuningBenchmark?.(prompt);
+    },
+    onRunHillClimb() {
+      const prompt = promptEl.value.trim() || PROMPT_PRESETS[0].prompt;
+      return callbacks.onRunHillClimb?.(prompt);
+    },
+    onResetBaseline() {
+      callbacks.onResetTuningBaseline?.();
+    },
+    async onCopyShareUrl() {
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(tuningShareUrl);
+        } catch {
+          // Fallback: ignore clipboard permission errors in headless runs
+        }
+      }
+      tuningCopied = true;
+      if (copiedTimer !== null) window.clearTimeout(copiedTimer);
+      copiedTimer = window.setTimeout(() => {
+        tuningCopied = false;
+        syncSubViews();
+      }, 1800);
+      syncSubViews();
+    },
+    onSelectStep(step) {
+      callbacks.onTuningConfigChange?.({ ...step.config });
     },
   });
 
@@ -567,7 +642,9 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
         t.optFlags.fusedSwigluQmm === optFlags.fusedSwigluQmm &&
         t.tokenMs > 0,
     );
-    if (abRace?.phase === "done" && abRace.optimized && tokenMatchesOpts && optFlags.oneDispatchAttention) {
+    if (zoom === 4 && tuningLastEval && tuningLastEval.tokPerSec > 0) {
+      readoutTpsEl.textContent = `${tuningLastEval.tokPerSec.toFixed(1)} tok/s`;
+    } else if (abRace?.phase === "done" && abRace.optimized && tokenMatchesOpts && optFlags.oneDispatchAttention) {
       readoutTpsEl.textContent = `${abRace.optimized.avgTokPerSec.toFixed(1)} tok/s`;
     } else if (matchingTokens.length > 0) {
       const sample = matchingTokens.length > 3 ? matchingTokens.slice(1) : matchingTokens;
@@ -853,6 +930,19 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
         parityResults,
         sampleSlice: latestSampleSlice,
       });
+    } else if (zoom === 4) {
+      tuningLab.update({
+        adapter: adapterInfo,
+        config: tuningConfig,
+        busy: generating || modelLoading || tuningClimbing,
+        climbing: tuningClimbing,
+        lastEval: tuningLastEval,
+        bestEval: tuningBestEval,
+        history: tuningHistory,
+        shareUrl: tuningShareUrl,
+        copied: tuningCopied,
+        agentRepoUrl: "https://github.com/joshuaswarren/omarchy-mlx-webgpu",
+      });
     } else {
       drawSparkline();
     }
@@ -868,6 +958,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     pane1.hidden = level !== 1;
     pane2.hidden = level !== 2;
     pane3.hidden = level !== 3;
+    pane4.hidden = level !== 4;
     syncSubViews();
     callbacks.onZoomChange?.(level);
   }
@@ -923,7 +1014,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   zoomTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
       const lvl = Number(tab.dataset.zoom) as ZoomLevel;
-      if (lvl === 1 || lvl === 2 || lvl === 3) setZoom(lvl);
+      if (lvl === 1 || lvl === 2 || lvl === 3 || lvl === 4) setZoom(lvl);
     });
   });
 
@@ -1015,6 +1106,7 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
     if (ev.key === "1") setZoom(1);
     else if (ev.key === "2") setZoom(2);
     else if (ev.key === "3") setZoom(3);
+    else if (ev.key === "4") setZoom(4);
     else if (ev.key === "f" || ev.key === "F") toggleFault();
   };
   window.addEventListener("keydown", onKeyDown);
@@ -1022,7 +1114,8 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
   const onResize = () => {
     if (zoom === 1) drawSparkline();
     else if (zoom === 2) kernelGraph.resize();
-    else inspector.resize();
+    else if (zoom === 3) inspector.resize();
+    else tuningLab.resize();
   };
   window.addEventListener("resize", onResize);
 
@@ -1035,12 +1128,14 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
 
   return {
     setAdapterInfo(info: GpuAdapterInfo) {
+      adapterInfo = info;
       adapterReady = true;
       adapterEl.classList.remove("is-error");
       const label = [info.vendor, info.architecture || info.device]
         .filter((s) => s && s !== "unknown")
         .join(" / ");
       adapterEl.textContent = `WebGPU: ${label || info.description || "active"}`;
+      syncSubViews();
     },
     setLoadProgress(progress: ModelLoadProgress) {
       if (progress.stage === "ready") {
@@ -1103,6 +1198,21 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
       renderAbRace();
       updateReadouts();
     },
+    setTuningState(next) {
+      if (next.config) tuningConfig = { ...next.config };
+      if (next.climbing !== undefined) tuningClimbing = next.climbing;
+      if (next.lastEval !== undefined) tuningLastEval = next.lastEval;
+      if (next.bestEval !== undefined) tuningBestEval = next.bestEval;
+      if (next.history !== undefined) tuningHistory = [...next.history];
+      if (next.shareUrl !== undefined) tuningShareUrl = next.shareUrl;
+      syncSubViews();
+    },
+    setPrompt(prompt: string) {
+      promptEl.value = prompt;
+    },
+    getPrompt() {
+      return promptEl.value.trim() || PROMPT_PRESETS[0].prompt;
+    },
     setParityResults(results: ParityResult[]) {
       parityResults = results;
       renderParity();
@@ -1150,13 +1260,16 @@ export function mountApp(root: HTMLElement, callbacks: AppCallbacks = {}): AppCo
         generating,
         selectedLayer,
         selectedKernel,
+        tuningConfig: { ...tuningConfig },
       };
     },
     destroy() {
+      if (copiedTimer !== null) window.clearTimeout(copiedTimer);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("resize", onResize);
       kernelGraph.destroy();
       inspector.destroy();
+      tuningLab.destroy();
     },
   };
 }
