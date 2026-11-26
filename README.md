@@ -24,8 +24,9 @@ Zero backend servers. Zero paid APIs. Weights stream once from Hugging Face and 
 
 | Configuration | Dispatches / token | Attention dispatches | Decode speed | Greedy output vs CPU ref |
 |---|---:|---:|---:|---|
-| Unfused baseline (2-dispatch split-K SDPA, separate QK-Norm/RoPE, separate Gate/Up/SwiGLU) | 537 | 56 | 43.8 tok/s | Identical (32/32 tokens) |
-| Optimized (PR #997 1-dispatch online SDPA + Fused QK-Norm+RoPE + Fused SwiGLU QMM) | 397 (`-140`) | 28 (`-28`) | 68.7 tok/s (`+57%`) | Identical (32/32 tokens) |
+| Unfused baseline (2-dispatch split-K SDPA, separate QK-Norm/RoPE, separate Gate/Up/SwiGLU) | 537 | 56 | 61.6 tok/s | Identical (48/48 tokens) |
+| PR #997 1-dispatch online-softmax attention only | 509 (`-28`) | 28 (`-28`) | 77.0 tok/s (`+25%`) | Identical (48/48 tokens) |
+| All 3 optimizations (PR #997 + Fused QK-Norm+RoPE + Fused SwiGLU QMM) | 397 (`-140`) | 28 (`-28`) | 82.4 tok/s (`+34%`) | Identical (48/48 tokens) |
 
 ### Upstream `omarchy-mlx` Linux Vulkan reference (public [PR #997](https://github.com/joshuaswarren/omarchy-mlx/pull/997))
 

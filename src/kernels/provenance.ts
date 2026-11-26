@@ -235,11 +235,11 @@ barrier();
     omarchyPath: "overlay/mlx/backend/omarchy/shaders/qmm_vec.comp",
     omarchyUrl: `${REPO_BLOB}/overlay/mlx/backend/omarchy/shaders/qmm_vec.comp`,
     wgslPath: "src/kernels/wgsl/qmm_vec.wgsl",
-    workgroupSize: [256, 1, 1],
+    workgroupSize: [128, 1, 1],
     summary:
       "Decodes packed 4-bit weights (8 nibbles per uint32, group_size=64 affine scale + bias) in registers inside the dot product.",
     portNotes:
-      "Every 32-lane slot walks contiguous packed weight words and input activations for coalesced memory bandwidth.",
+      "4 slots of 32 lanes (2 rows/slot = 8 rows/WG), direct vec4<f32> x loads and coalesced vec2<u32> weight loads with zero K-loop barriers.",
     glslSnippet: `// overlay/mlx/backend/omarchy/shaders/qmm_vec.comp (QMM_VEC_Q4_WORD)
 // Unpack 8 affine 4-bit nibbles per uint32 word in registers (group_size = 64)
 uint packed = weights.values[row * words_per_row + w];
@@ -261,7 +261,7 @@ acc += fma(scale, dot, input_sum * bias);`,
     omarchyPath: "overlay/mlx/backend/omarchy/shaders/qmm_vec.comp",
     omarchyUrl: `${REPO_BLOB}/overlay/mlx/backend/omarchy/shaders/qmm_vec.comp#L2225`,
     wgslPath: "src/kernels/wgsl/qmm_vec_swiglu.wgsl",
-    workgroupSize: [256, 1, 1],
+    workgroupSize: [128, 1, 1],
     summary:
       "Reads the MLP input vector once, computes both Gate and Up 4-bit dot products in lockstep, and applies SiLU(gate) * up before storing.",
     portNotes:
@@ -447,9 +447,9 @@ export function buildSyntheticSchedule(opts: OptFlags, seqLen = 192): DispatchEv
 
   for (let layer = 0; layer < cfg.numHiddenLayers; layer++) {
     push(layer, "fast_norm", "input_layernorm", [1, 1, 1], [256, 1, 1], H * 8, H * 4, 11);
-    push(layer, "qmm_vec", "q_proj (Q4)", [Math.ceil((Q * D) / 8), 1, 1], [256, 1, 1], q4Bytes(Q * D, H), Q * D * 4, 38);
-    push(layer, "qmm_vec", "k_proj (Q4)", [Math.ceil((KV * D) / 8), 1, 1], [256, 1, 1], q4Bytes(KV * D, H), KV * D * 4, 24);
-    push(layer, "qmm_vec", "v_proj (Q4)", [Math.ceil((KV * D) / 8), 1, 1], [256, 1, 1], q4Bytes(KV * D, H), KV * D * 4, 24);
+    push(layer, "qmm_vec", "q_proj (Q4)", [Math.ceil((Q * D) / 8), 1, 1], [128, 1, 1], q4Bytes(Q * D, H), Q * D * 4, 38);
+    push(layer, "qmm_vec", "k_proj (Q4)", [Math.ceil((KV * D) / 8), 1, 1], [128, 1, 1], q4Bytes(KV * D, H), KV * D * 4, 24);
+    push(layer, "qmm_vec", "v_proj (Q4)", [Math.ceil((KV * D) / 8), 1, 1], [128, 1, 1], q4Bytes(KV * D, H), KV * D * 4, 24);
 
     if (opts.fusedRopeNorm) {
       push(layer, "fast_rope_norm", "Q norm+RoPE (fused)", [Q, 1, 1], [128, 1, 1], Q * D * 4 + D * 4, Q * D * 4, 13);
@@ -497,7 +497,7 @@ export function buildSyntheticSchedule(opts: OptFlags, seqLen = 192): DispatchEv
       );
     }
 
-    push(layer, "qmm_vec", "o_proj (Q4)", [Math.ceil(H / 8), 1, 1], [256, 1, 1], q4Bytes(H, Q * D), H * 4, 38);
+    push(layer, "qmm_vec", "o_proj (Q4)", [Math.ceil(H / 8), 1, 1], [128, 1, 1], q4Bytes(H, Q * D), H * 4, 38);
     push(layer, "residual_add", "residual_add (attn)", [Math.ceil(H / 256), 1, 1], [256, 1, 1], H * 8, H * 4, 8);
     push(layer, "fast_norm", "post_attn_layernorm", [1, 1, 1], [256, 1, 1], H * 8, H * 4, 11);
 
@@ -507,25 +507,25 @@ export function buildSyntheticSchedule(opts: OptFlags, seqLen = 192): DispatchEv
         "qmm_vec_swiglu",
         "gate+up+SwiGLU (fused Q4)",
         [Math.ceil(I / 8), 1, 1],
-        [256, 1, 1],
+        [128, 1, 1],
         q4Bytes(I, H) * 2 + H * 4,
         I * 4,
         74,
       );
     } else {
-      push(layer, "qmm_vec", "gate_proj (Q4)", [Math.ceil(I / 8), 1, 1], [256, 1, 1], q4Bytes(I, H) + H * 4, I * 4, 48);
-      push(layer, "qmm_vec", "up_proj (Q4)", [Math.ceil(I / 8), 1, 1], [256, 1, 1], q4Bytes(I, H) + H * 4, I * 4, 48);
+      push(layer, "qmm_vec", "gate_proj (Q4)", [Math.ceil(I / 8), 1, 1], [128, 1, 1], q4Bytes(I, H) + H * 4, I * 4, 48);
+      push(layer, "qmm_vec", "up_proj (Q4)", [Math.ceil(I / 8), 1, 1], [128, 1, 1], q4Bytes(I, H) + H * 4, I * 4, 48);
       push(layer, "swiglu", "swiglu activation", [Math.ceil(I / 256), 1, 1], [256, 1, 1], I * 8, I * 4, 14);
     }
 
-    push(layer, "qmm_vec", "down_proj (Q4)", [Math.ceil(H / 8), 1, 1], [256, 1, 1], q4Bytes(H, I) + I * 4, H * 4, 46);
+    push(layer, "qmm_vec", "down_proj (Q4)", [Math.ceil(H / 8), 1, 1], [128, 1, 1], q4Bytes(H, I) + I * 4, H * 4, 46);
     push(layer, "residual_add", "residual_add (mlp)", [Math.ceil(H / 256), 1, 1], [256, 1, 1], H * 8, H * 4, 8);
   }
 
   // Output head (4 dispatches: final_norm, lm_head, argmax P1, argmax P2)
   const amaxBlocks = Math.ceil(V / 1024);
   push(-1, "fast_norm", "final_norm", [1, 1, 1], [256, 1, 1], H * 8, H * 4, 12);
-  push(-1, "qmm_vec", "lm_head (tied Q4)", [Math.ceil(V / 8), 1, 1], [256, 1, 1], q4Bytes(V, H) + H * 4, V * 4, 420);
+  push(-1, "qmm_vec", "lm_head (tied Q4)", [Math.ceil(V / 8), 1, 1], [128, 1, 1], q4Bytes(V, H) + H * 4, V * 4, 420);
   push(-1, "argmax", "argmax P1", [amaxBlocks, 1, 1], [256, 1, 1], V * 4, amaxBlocks * 8, 12);
   push(-1, "argmax", "argmax P2", [1, 1, 1], [256, 1, 1], amaxBlocks * 8, 8, 5);
 

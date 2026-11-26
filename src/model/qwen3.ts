@@ -604,9 +604,9 @@ export class Qwen3WebGpuEngine {
       const lb = this.layerBgs[l];
 
       run(l, "fast_norm", "input_layernorm", this.pipelines.fastNorm, lb.inNorm, [1, 1, 1], [256, 1, 1], H * 8, H * 4);
-      run(l, "qmm_vec", "q_proj (Q4)", this.pipelines.qmmVec, lb.qProj, gQ, [256, 1, 1], q4Bytes(qDim, H) + H * 4, qDim * 4);
-      run(l, "qmm_vec", "k_proj (Q4)", this.pipelines.qmmVec, lb.kProj, gKV, [256, 1, 1], q4Bytes(kvDim, H) + H * 4, kvDim * 4);
-      run(l, "qmm_vec", "v_proj (Q4)", this.pipelines.qmmVec, lb.vProj, gKV, [256, 1, 1], q4Bytes(kvDim, H) + H * 4, kvDim * 4);
+      run(l, "qmm_vec", "q_proj (Q4)", this.pipelines.qmmVec, lb.qProj, gQ, [128, 1, 1], q4Bytes(qDim, H) + H * 4, qDim * 4);
+      run(l, "qmm_vec", "k_proj (Q4)", this.pipelines.qmmVec, lb.kProj, gKV, [128, 1, 1], q4Bytes(kvDim, H) + H * 4, kvDim * 4);
+      run(l, "qmm_vec", "v_proj (Q4)", this.pipelines.qmmVec, lb.vProj, gKV, [128, 1, 1], q4Bytes(kvDim, H) + H * 4, kvDim * 4);
 
       if (opts.fusedRopeNorm) {
         run(l, "fast_rope_norm", "q_norm + RoPE (fused)", this.pipelines.fastRopeNorm, lb.qRopeNorm, [Q, 1, 1], [128, 1, 1], qDim * 4 + D * 4, qDim * 4);
@@ -631,26 +631,26 @@ export class Qwen3WebGpuEngine {
         run(l, "sdpa_decode_split_p2", "SDPA split-K P2", this.pipelines.sdpaSplitP2, lb.sdpaSplitP2, [Q, 1, 1], [128, 1, 1], scratchBytes, qDim * 4);
       }
 
-      run(l, "qmm_vec", "o_proj (Q4)", this.pipelines.qmmVec, lb.oProj, gH, [256, 1, 1], q4Bytes(H, qDim) + qDim * 4, H * 4);
+      run(l, "qmm_vec", "o_proj (Q4)", this.pipelines.qmmVec, lb.oProj, gH, [128, 1, 1], q4Bytes(H, qDim) + qDim * 4, H * 4);
       run(l, "residual_add", "attn residual", this.pipelines.residualAdd, lb.res1, [Math.ceil(H / 256), 1, 1], [256, 1, 1], H * 8, H * 4);
 
       run(l, "fast_norm", "post_attn_layernorm", this.pipelines.fastNorm, lb.postNorm, [1, 1, 1], [256, 1, 1], H * 8, H * 4);
 
       if (opts.fusedSwigluQmm) {
-        run(l, "qmm_vec_swiglu", "gate+up+SwiGLU (fused)", this.pipelines.qmmVecSwiglu, lb.fusedSwiglu, gI, [256, 1, 1], q4Bytes(I, H) * 2 + H * 4, I * 4);
+        run(l, "qmm_vec_swiglu", "gate+up+SwiGLU (fused)", this.pipelines.qmmVecSwiglu, lb.fusedSwiglu, gI, [128, 1, 1], q4Bytes(I, H) * 2 + H * 4, I * 4);
       } else {
-        run(l, "qmm_vec", "gate_proj (Q4)", this.pipelines.qmmVec, lb.gateProj, gI, [256, 1, 1], q4Bytes(I, H) + H * 4, I * 4);
-        run(l, "qmm_vec", "up_proj (Q4)", this.pipelines.qmmVec, lb.upProj, gI, [256, 1, 1], q4Bytes(I, H) + H * 4, I * 4);
+        run(l, "qmm_vec", "gate_proj (Q4)", this.pipelines.qmmVec, lb.gateProj, gI, [128, 1, 1], q4Bytes(I, H) + H * 4, I * 4);
+        run(l, "qmm_vec", "up_proj (Q4)", this.pipelines.qmmVec, lb.upProj, gI, [128, 1, 1], q4Bytes(I, H) + H * 4, I * 4);
         run(l, "swiglu", "swiglu", this.pipelines.swiglu, lb.swiglu, [Math.ceil(I / 256), 1, 1], [256, 1, 1], I * 8, I * 4);
       }
 
-      run(l, "qmm_vec", "down_proj (Q4)", this.pipelines.qmmVec, lb.downProj, gH, [256, 1, 1], q4Bytes(H, I) + I * 4, H * 4);
+      run(l, "qmm_vec", "down_proj (Q4)", this.pipelines.qmmVec, lb.downProj, gH, [128, 1, 1], q4Bytes(H, I) + I * 4, H * 4);
       run(l, "residual_add", "mlp residual", this.pipelines.residualAdd, lb.res2, [Math.ceil(H / 256), 1, 1], [256, 1, 1], H * 8, H * 4);
     }
 
     if (computeLogits) {
       run(-1, "fast_norm", "final_norm", this.pipelines.fastNorm, this.bgFinalNorm, [1, 1, 1], [256, 1, 1], H * 8, H * 4);
-      run(-1, "qmm_vec", "lm_head (tied Q4)", this.pipelines.qmmVec, this.bgLmHead, gV, [256, 1, 1], q4Bytes(V, H) + H * 4, V * 4);
+      run(-1, "qmm_vec", "lm_head (tied Q4)", this.pipelines.qmmVec, this.bgLmHead, gV, [128, 1, 1], q4Bytes(V, H) + H * 4, V * 4);
       run(-1, "argmax", "argmax P1", this.pipelines.argmaxP1, this.bgArgmaxP1, [this.amaxBlocks, 1, 1], [256, 1, 1], V * 4, this.amaxBlocks * 8);
       run(-1, "argmax", "argmax P2", this.pipelines.argmaxP2, this.bgArgmaxP2, [1, 1, 1], [256, 1, 1], this.amaxBlocks * 8, 8);
     }
